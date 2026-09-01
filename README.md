@@ -97,10 +97,9 @@ sudo systemctl restart dsh   # 或你的启动方式
 
 ## 发布流程
 
-npm 与 GitHub 同步发布，标准操作见主仓库
-[`docs/github-release-sop.md`](https://github.com/NoelJudeNoel/dshost-plugin)（或
-dshost 主仓 `docs/`）：改动 → `version` bump → `npm publish` →
+npm 与 GitHub 同步发布：改动主仓源码 → bump `version` → `npm publish` →
 `bash scripts/publish-github.sh`（同步 GitHub、打 `vX.Y.Z` tag、刷新 topics）。
+完整标准规则见 [`docs/github-release-sop.md`](./docs/github-release-sop.md)。
 
 ## License
 
