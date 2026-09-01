@@ -1,0 +1,14 @@
+# dsh-remote plugin bundle patch.
+#
+# Intentionally EMPTY: the agent entry (id: dsh-remote-agent) must be declared
+# by the USER's profile cordis.patch.yml, NOT here.
+#
+# Why: cordis applies this file (dsh.bundle.patch) on `dsh plugin add`, and the
+# user profile patch is merged on top. If both declared `- id: dsh-remote-agent`
+# via `- insert:`, the loader saw the same id twice -> duplicate loader entry
+# id -> dsh crashed on startup (systemd restart loop).
+#
+# The plugin is still loaded by cordis because the user profile entry references
+# it by name ('dshost-plugin'); this file only needs to exist for
+# the bundle mechanism.
+[]

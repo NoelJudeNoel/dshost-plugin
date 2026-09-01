@@ -1,0 +1,5 @@
+node_modules/
+lib/core.js
+lib/protocol.js
+*.tgz
+.DS_Store

@@ -1,0 +1,50 @@
+{
+  "name": "dshost-plugin",
+  "version": "0.1.8",
+  "description": "Official remote cloud relay plugin for DSHost (dshost.me): securely access your dsh Web UI from anywhere",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "scripts"
+  ],
+  "scripts": {
+    "prepack": "node scripts/prepack.mjs",
+    "prepare": "node scripts/prepack.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "deepseek-harness",
+    "remote-access",
+    "relay",
+    "websocket",
+    "tunnel"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NoelJudeNoel/dshost-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NoelJudeNoel/dshost-plugin/issues"
+  },
+  "homepage": "https://dshost.me",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
