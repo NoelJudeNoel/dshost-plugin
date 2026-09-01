@@ -6,7 +6,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-NoelJudeNoel%2Fdshost--plugin-blue)](https://github.com/NoelJudeNoel/dshost-plugin)
 
 **DSHost 官方 DSH 远程中继插件** — 在你的 dsh（DeepSeek Harness）实例上运行一个 Agent，
-通过 `wss` 主动外连 DHost 中继，让你在世界任何地方用浏览器安全访问自己的 dsh Web UI，
+通过 `wss` 主动外连 DSHost 中继，让你在世界任何地方用浏览器安全访问自己的 dsh Web UI，
 无需公网 IP、无需端口映射。
 
 *Official remote cloud relay plugin for DSHost (dshost.me): securely access your
