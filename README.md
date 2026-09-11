@@ -30,7 +30,10 @@ dsh Web UI from anywhere.*
 ### 2. 一键安装（推荐）
 
 ```bash
+# macOS / Linux
 curl -fsSL https://dshost.me/install.sh | bash
+# Windows (PowerShell)
+$env:RELAY_HOST='dshost.me'; irm https://dshost.me/install.ps1 | iex
 ```
 
 脚本会安装 pnpm、通过 `dsh plugin add dshost-plugin` 把插件装入当前 profile，
