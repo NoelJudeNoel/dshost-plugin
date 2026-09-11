@@ -68,6 +68,20 @@ function getInstanceId() {
 }
 
 /**
+ * Effective instance id. DSH_INSTANCE_ID (env) overrides the derived id —
+ * used when a dedicated services agent coexists with the dsh-hosted plugin
+ * on the SAME machine: both derive the identical hostname+machine-id id,
+ * and the relay would treat them as one instance, evicting each other in a
+ * reconnect war. The override must be stable across restarts (it is the
+ * key sessions/tickets bind to).
+ */
+function getEffectiveInstanceId() {
+  const override = (process.env.DSH_INSTANCE_ID || '').trim();
+  if (override && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(override)) return override;
+  return getInstanceId();
+}
+
+/**
  * Collect every real disk partition (df -kPT), not just the root filesystem.
  * Filters to physical filesystems (/dev/* or common on-disk types), excludes
  * tmpfs/proc/sys/overlay etc. Falls back to statfsSync('/') if df is missing
@@ -236,7 +250,7 @@ export function collectSystemInfo(defaultVersion) {
   const cpus = os.cpus();
   const meta = detectDshMetadata();
   return {
-    instanceId: getInstanceId(),
+    instanceId: getEffectiveInstanceId(),
     hostname: os.hostname(),
     platform: os.platform(),
     release: os.release(),
@@ -253,9 +267,84 @@ export function collectSystemInfo(defaultVersion) {
     diskFree,
     dshVersion: defaultVersion || meta.dshVersion,
     plugins: meta.plugins,
+    // 服务旁挂：独立 services agent（DSH_SERVICES_ONLY=1，无本地 dsh 承载）
+    // 上报 role=services，relay 不将其注册为主实例，只挂到同 hostname 的主实例下
+    role: process.env.DSH_SERVICES_ONLY === '1' ? 'services' : 'dsh',
     // 无头检测：供 relay 注入脚本决定产物点击行为(新窗口HTTP直出 vs 本地打开)
     headless: !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY,
   };
+}
+
+// ── Plugin workspace services（config.services）───────────────────────
+// 实例在 cordis.patch.yml（插件配置）或 standalone agent 的 DSH_SERVICES env
+// JSON 中声明的本地/内网上游清单。relay 只能经本 agent 隧道触达这些上游。
+// 安全关键：上游白名单在此强制 —— 回环 + EasyTier mesh 10.144.144.0/24 +
+// AGENT_UPSTREAM_ALLOW 显式追加。被攻破的 relay 也无法借隧道横移到宿主者
+// 未声明的任意内网地址；仅接受字面 IP（localhost 归一为 127.0.0.1），
+// 不做 DNS 解析，杜绝 DNS rebinding 绕过白名单。
+const SVC_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+function parseUpstream(raw) {
+  const m = /^(.+):(\d{1,5})$/.exec(String(raw || '').trim());
+  if (!m) return null;
+  const host = m[1].toLowerCase() === 'localhost' ? '127.0.0.1' : m[1];
+  const port = parseInt(m[2], 10);
+  if (!/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i.test(host)) return null;
+  if (port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+function upstreamAllowed(host) {
+  if (host === '::1' || /^127\./.test(host)) return true;
+  if (/^10\.144\.144\./.test(host)) return true; // EasyTier wolo-mesh 网段
+  const extra = (process.env.AGENT_UPSTREAM_ALLOW || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return extra.includes(host);
+}
+
+/**
+ * Normalize + validate the declared services list. Invalid entries are
+ * skipped with a warning, never thrown — one bad line must not take down
+ * the dsh remote tunnel.
+ * @returns {Array<{id,name,desc,icon,auth,entry,ssoSecret,host,port}>}
+ */
+export function normalizeServices(raw, log) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const s of raw) {
+    if (!s || typeof s !== 'object') continue;
+    const id = String(s.id || '').trim();
+    const up = parseUpstream(s.upstream);
+    if (!SVC_ID_RE.test(id) || id === 'dsh') {
+      log?.warn?.(`[agent] service "${id || '(unnamed)'}": invalid/reserved id, skipped`);
+      continue;
+    }
+    if (seen.has(id)) continue;
+    if (!up) {
+      log?.warn?.(`[agent] service "${id}": bad upstream "${s.upstream}" (want host:port), skipped`);
+      continue;
+    }
+    if (!upstreamAllowed(up.host)) {
+      log?.warn?.(`[agent] service "${id}": upstream ${up.host} not in allowlist (loopback / 10.144.144.0/24 / AGENT_UPSTREAM_ALLOW), skipped`);
+      continue;
+    }
+    seen.add(id);
+    out.push({
+      id,
+      name: String(s.name || id).slice(0, 64),
+      desc: String(s.desc || '').slice(0, 200),
+      icon: String(s.icon || '').slice(0, 32),
+      auth: s.auth === 'sso' ? 'sso' : 'open',
+      entry: typeof s.entry === 'string' && s.entry.startsWith('/') ? s.entry : '/',
+      ssoSecret: typeof s.ssoSecret === 'string' && s.ssoSecret ? s.ssoSecret : '',
+      spa: s.spa === true,
+      basicUser: typeof s.basicUser === 'string' ? s.basicUser : '',
+      basicPassword: typeof s.basicPassword === 'string' ? s.basicPassword : '',
+      host: up.host,
+      port: up.port,
+    });
+  }
+  return out;
 }
 
 /**
@@ -269,6 +358,7 @@ export function collectSystemInfo(defaultVersion) {
  * @param {string} [opts.webToken]   local dsh web launch token (dsh >= 0.1.2 auth mode)
  * @param {object} [opts.log]        logger with log/warn/error (default console)
  * @param {string} [opts.dshVersion] reported dsh version (default rc.6)
+ * @param {Array}  [opts.services]   plugin workspace services (see normalizeServices)
  * @returns {{ stop: () => void }}
  */
 export function startAgent(opts) {
@@ -280,7 +370,15 @@ export function startAgent(opts) {
     dshPort = 3080,
     log = console,
     dshVersion,
+    services = [],
   } = opts;
+
+  const svcList = normalizeServices(services, log);
+  const svcMap = new Map(svcList.map((s) => [s.id, s]));
+  let relayUsername = null; // set on 'registered'; subject of SSO trust headers
+  if (svcList.length) {
+    log.log?.(`[agent] plugin services: ${svcList.map((s) => `${s.id}->${s.host}:${s.port}${s.auth === 'sso' ? ' (sso)' : ''}`).join(', ')}`);
+  }
 
   if (!token) {
     log.error?.('[agent] No token configured.');
@@ -372,8 +470,16 @@ export function startAgent(opts) {
       if (msg.type === 'registered') {
         registered = true;
         reconnectAttempt = 0;
+        relayUsername = msg.username || null;
         log.log?.(`[agent] Registered as ${msg.username} (session ${msg.sessionId || ''})`);
         send(ws, { type: 'system-info', info: collectSystemInfo(dshVersion) });
+        // 插件工作区：上报本实例声明的服务清单（relay 存实例维度，供 /p 路由校验）
+        // DSH_SERVICES_ONLY=1：独立 services agent，relay 不注册主实例（服务旁挂到同机 dsh 实例）
+        send(ws, {
+          type: 'services',
+          servicesOnly: process.env.DSH_SERVICES_ONLY === '1' || undefined,
+          services: svcList.map(({ id, name, desc, icon, auth, entry, spa }) => ({ id, name, desc, icon, auth, entry, spa })),
+        });
         startHeartbeat(ws);
         return;
       }
@@ -381,7 +487,8 @@ export function startAgent(opts) {
       if (msg.type === 'heartbeat') return;
 
       if (msg.type === 'http:request') {
-        if (serveArtifactIfRequested(ws, msg)) return;
+        // [Artifact Viewer] 是 dsh UI 注入脚本的专属旁路；插件流不经过它。
+        if (!msg.target && serveArtifactIfRequested(ws, msg)) return;
         handleHttpRequest(ws, msg);
       } else if (msg.type === 'http:body') {
         const ab = artifactFormBodies.get(msg.streamId);
@@ -394,9 +501,13 @@ export function startAgent(opts) {
         const stream = streams.get(msg.streamId);
         if (stream && stream.dshReq) stream.dshReq.end();
       } else if (msg.type === 'ws:open') {
-        // dsh >= 0.1.2: make sure the auth cookie exists before the upgrade.
-        if ((webToken || authCookie) && !authCookie) mintAuthCookie().then(() => handleWsOpen(ws, msg));
-        else handleWsOpen(ws, msg);
+        // dsh >= 0.1.2: make sure the auth cookie exists before the upgrade
+        // （仅 dsh 目标需要本地 web auth cookie；插件上游不做 cookie 注入）。
+        if ((!msg.target || msg.target === 'dsh') && (webToken || authCookie) && !authCookie) {
+          mintAuthCookie().then(() => handleWsOpen(ws, msg));
+        } else {
+          handleWsOpen(ws, msg);
+        }
       } else if (msg.type === 'ws:frame') {
         const stream = streams.get(msg.streamId);
         if (stream && stream.dshWs) {
@@ -456,9 +567,17 @@ export function startAgent(opts) {
 
   function startHeartbeat(ws) {
     if (heartbeatInterval) clearInterval(heartbeatInterval);
+    // 半开死链看门狗：只发不收时 TCP 仍 ESTAB（FIN 被代理链路吞掉的场景），
+    // close 事件永远不来，agent 变僵尸。每次 ping 记账，收到任意下行帧清零；
+    // 连续 3 个周期（45s）无下行则主动 terminate() 触发重连。
+    let lastRx = Date.now();
+    ws.on('message', () => { lastRx = Date.now(); });
     heartbeatInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        send(ws, { type: 'heartbeat', ts: Date.now() });
+      if (ws.readyState !== WebSocket.OPEN) return;
+      send(ws, { type: 'heartbeat', ts: Date.now() });
+      if (Date.now() - lastRx > 45000) {
+        log.log?.('[agent] heartbeat watchdog: no inbound for 45s, forcing reconnect');
+        try { ws.terminate(); } catch (eT) {}
       }
     }, 15000);
   }
@@ -560,29 +679,68 @@ export function startAgent(opts) {
     streams.delete(streamId);
   }
 
+  /** Resolve msg.target to a dial target. null = plugin not declared. */
+  function resolveTarget(msg) {
+    const t = msg.target || 'dsh';
+    if (t === 'dsh') return { id: 'dsh', host: dshHost, port: dshPort, dsh: true, svc: null };
+    const svc = svcMap.get(t);
+    if (!svc) return null;
+    return { id: t, host: svc.host, port: svc.port, dsh: false, svc };
+  }
+
+  /** auth:'sso' 服务出站的信任头（M3：relay↔业务系统共享密钥的 HMAC 链）。 */
+  function ssoHeaders(svc) {
+    if (!svc || svc.auth !== 'sso' || !svc.ssoSecret || !relayUsername) return {};
+    const ts = Date.now().toString();
+    const sig = crypto.createHmac('sha256', svc.ssoSecret).update(`${relayUsername}.${ts}`).digest('hex');
+    return { 'x-sso-user': relayUsername, 'x-sso-ts': ts, 'x-sso-sig': sig };
+  }
+
+  /** auth:'open' 服务的上游 Basic 凭据注入（服务自身保留 Basic Auth 时的代填）。 */
+  function basicHeader(svc) {
+    if (!svc || svc.auth !== 'open' || !svc.basicPassword) return undefined;
+    return 'Basic ' + Buffer.from(`${svc.basicUser || 'user'}:${svc.basicPassword}`).toString('base64');
+  }
+
   function handleHttpRequest(ws, msg, isRetry) {
     const { streamId, method, path, headers } = msg;
+    const target = resolveTarget(msg);
+    if (!target) {
+      respondError(ws, streamId, 404, `dsh-remote: plugin "${msg.target}" is not declared on this instance`);
+      return;
+    }
 
     // dsh >= 0.1.2 web auth: inject the minted browser cookie when we have
     // one. dsh <= 0.1.1 has no web auth; with no token/cookie nothing is
     // injected and requests go out exactly like plugin 0.1.5 sent them.
+    // 插件上游：不注入 dsh cookie，注入 SSO 信任头（若声明），剥除 Origin。
     const issue = (cookie) => {
-      const dshHeaders = {
+      const upstreamHeaders = {
         ...headers,
-        host: `${dshHost}:${dshPort}`,
-        origin: `http://${dshHost}:${dshPort}`,
+        host: `${target.host}:${target.port}`,
       };
-      if (cookie) dshHeaders.cookie = cookie;
-      delete dshHeaders['content-length'];
+      if (target.dsh) {
+        upstreamHeaders.origin = `http://${target.host}:${target.port}`;
+        if (cookie) upstreamHeaders.cookie = cookie;
+      } else {
+        delete upstreamHeaders.origin;
+        // 插件上游不透传 dshost 站点 Cookie（dsh_session 等），业务自身的
+        // Bearer authorization 保留（relay 侧已放行）。
+        delete upstreamHeaders.cookie;
+        Object.assign(upstreamHeaders, ssoHeaders(target.svc));
+        const basic = basicHeader(target.svc);
+        if (basic) upstreamHeaders.authorization = basic;
+      }
+      delete upstreamHeaders['content-length'];
 
       const dshReq = http.request({
-        hostname: dshHost,
-        port: dshPort,
+        hostname: target.host,
+        port: target.port,
         path,
         method,
-        headers: dshHeaders,
+        headers: upstreamHeaders,
       }, (dshRes) => {
-        if (dshRes.statusCode === 401 && cookie) {
+        if (target.dsh && dshRes.statusCode === 401 && cookie) {
           // Cached cookie rejected (launch token rotated, e.g. dsh restarted).
           // Re-mint; body-less requests are retried once with the fresh
           // cookie, everything else forwards the 401 and the browser app
@@ -640,14 +798,14 @@ export function startAgent(opts) {
           streams.delete(streamId);
         });
         dshRes.on('error', () => {
-          send(ws, { type: 'error', streamId, message: 'Local dsh response error' });
+          send(ws, { type: 'error', streamId, message: `${target.dsh ? 'Local dsh' : `Plugin ${target.id}`} response error` });
           streams.delete(streamId);
         });
       });
 
       dshReq.on('error', (err) => {
         log.error?.(`[agent] HTTP Error: ${err.message}`);
-        send(ws, { type: 'error', streamId, message: err.message });
+        send(ws, { type: 'error', streamId, message: `${target.dsh ? 'local dsh' : `plugin ${target.id}`} upstream: ${err.message}` });
         streams.delete(streamId);
       });
 
@@ -661,7 +819,9 @@ export function startAgent(opts) {
       if (method === 'GET' || method === 'HEAD') dshReq.end();
     };
 
-    if ((webToken || authCookie) && !authCookie) {
+    if (!target.dsh) {
+      issue(undefined);
+    } else if ((webToken || authCookie) && !authCookie) {
       // A token is known but the eager mint has not landed yet (startup
       // race): mint first, then issue. Body frames arriving during the mint
       // window are dropped (no streams entry yet) — only POSTs racing the
@@ -675,19 +835,32 @@ export function startAgent(opts) {
 
   function handleWsOpen(ws, msg) {
     const { streamId, path, headers } = msg;
-    const dshWsUrl = `ws://${dshHost}:${dshPort}${path || '/'}`;
-    log.log?.(`[agent] WS OPEN stream ${streamId} -> ${dshWsUrl}`);
+    const target = resolveTarget(msg);
+    if (!target) {
+      send(ws, { type: 'error', streamId, message: `dsh-remote: plugin "${msg.target}" is not declared on this instance` });
+      return;
+    }
+    const dshWsUrl = `ws://${target.host}:${target.port}${path || '/'}`;
+    log.log?.(`[agent] WS OPEN stream ${streamId} -> ${target.id}@${dshWsUrl}`);
 
     const options = {
       headers: {
         ...headers,
-        host: `${dshHost}:${dshPort}`,
-        origin: `https://${dshHost}:${dshPort}`,
+        host: `${target.host}:${target.port}`,
       },
       rejectUnauthorized: false,
     };
-    // dsh >= 0.1.2 gates the WS upgrade behind the same browser cookie.
-    if (authCookie) options.headers.cookie = authCookie;
+    if (target.dsh) {
+      // dsh 信任栅栏要求 Origin 与本地 web 一致
+      options.headers.origin = `https://${target.host}:${target.port}`;
+      // dsh >= 0.1.2 gates the WS upgrade behind the same browser cookie.
+      if (authCookie) options.headers.cookie = authCookie;
+    } else {
+      delete options.headers.origin;
+      Object.assign(options.headers, ssoHeaders(target.svc));
+      const basic = basicHeader(target.svc);
+      if (basic) options.headers.authorization = basic;
+    }
 
     const dshWs = new WebSocket(dshWsUrl, undefined, options);
     const pending = [];

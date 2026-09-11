@@ -6,7 +6,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-NoelJudeNoel%2Fdshost--plugin-blue)](https://github.com/NoelJudeNoel/dshost-plugin)
 
 **DSHost 官方 DSH 远程中继插件** — 在你的 dsh（DeepSeek Harness）实例上运行一个 Agent，
-通过 `wss` 主动外连 DHost 中继，让你在世界任何地方用浏览器安全访问自己的 dsh Web UI，
+通过 `wss` 主动外连 DSHost 中继，让你在世界任何地方用浏览器安全访问自己的 dsh Web UI，
 无需公网 IP、无需端口映射。
 
 *Official remote cloud relay plugin for DSHost (dshost.me): securely access your
@@ -15,7 +15,7 @@ dsh Web UI from anywhere.*
 ## 特性
 
 - **零公网 IP**：Agent 主动外连中继（`wss://dshost.me/agent`），本机不开任何入站端口
-- **零破坏性多版本兼容**：同时支持 dsh `0.0.1-rc.*` / `0.1.0-rc.*` / `0.1.1-*` / `0.1.2-*`
+- **零破坏性多版本兼容**：同时支持 dsh `0.0.1-rc.*` / `0.1.0-rc.*` / `0.1.1-*` ~ `0.1.5-*`
 - **安全**：中继层 Host/Origin 重写遵守 dsh 信任栅栏；`settings.describe` 密钥脱敏下发；
   生产环境强制 `wss://`
 - **随 dsh 启动**：以 cordis 插件身份随 `dsh web` 加载，自动重连、休眠省流
@@ -47,7 +47,7 @@ dsh plugin add dshost-plugin
 
 ```yaml
 - insert:
-    - id: dsh-remote-agent
+    - id: dshost-agent
       name: 'dshost-plugin'
       config:
         token: dsh_your_token_here
@@ -76,6 +76,7 @@ sudo systemctl restart dsh   # 或你的启动方式
 
 | dsh 版本 | 支持 |
 |---|---|
+| `0.1.5-*`（已实证 `0.1.5-rc.1`） / `0.1.4-*` / `0.1.3-*` | ✔ |
 | `0.1.2-*`（含 `--trusted-host`、BrowserAuth、remote.mux） | ✔ |
 | `0.1.1-*` / `0.1.0-rc.7+`（insert 块 patch 格式） | ✔ |
 | `0.1.0-rc.2 ~ rc.6` / `0.0.1-rc.*` | ✔（旧包名 `@noeljude/dsh-remote-plugin` 亦可解析） |

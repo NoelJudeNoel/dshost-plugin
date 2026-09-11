@@ -36,10 +36,10 @@ export function sanitizeCloseCode(code) {
 }
 
 // Relay -> Agent
-export const HTTP_REQUEST = 'http:request'; // { streamId, method, path, headers }
+export const HTTP_REQUEST = 'http:request'; // { streamId, method, path, headers, target? }
 export const HTTP_BODY = 'http:body';        // { streamId, data }
 export const HTTP_END = 'http:end';          // { streamId }
-export const WS_OPEN = 'ws:open';            // { streamId, path, headers }
+export const WS_OPEN = 'ws:open';            // { streamId, path, headers, target? }
 export const WS_FRAME = 'ws:frame';          // { streamId, data, binary }
 export const WS_CLOSE = 'ws:close';          // { streamId, code, reason }
 
@@ -53,3 +53,8 @@ export const ERROR = 'error';                 // { streamId?, message }
 export const REGISTER = 'register';    // Agent -> Relay: { token, version }
 export const REGISTERED = 'registered'; // Relay -> Agent: { username, sessionId }
 export const HEARTBEAT = 'heartbeat';  // { ts }
+
+// Agent -> Relay: advertise the plugin workspace services declared in this
+// instance's cordis config (config.services). Sent right after system-info.
+// { services: [{id, name, desc, icon, auth, mount, upstreamLabel}] }
+export const SERVICES = 'services';
