@@ -31,7 +31,7 @@ dsh Web UI from anywhere.*
 
 ```bash
 # macOS / Linux
-curl -fsSL https://dshost.me/install.sh | bash
+curl -fsSL https://dshost.me/install.sh | RELAY_HOST=dshost.me bash
 # Windows (PowerShell)
 $env:RELAY_HOST='dshost.me'; irm https://dshost.me/install.ps1 | iex
 ```
