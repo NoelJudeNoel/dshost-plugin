@@ -1,6 +1,6 @@
 {
   "name": "dshost-plugin",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Official remote cloud relay plugin for DSHost (dshost.me): securely access your dsh Web UI from anywhere",
   "type": "module",
   "main": "lib/index.js",

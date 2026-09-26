@@ -458,7 +458,19 @@ export function startAgent(opts) {
     log.log?.(`[agent] Connecting to ${relayUrl} ...`);
     const ws = new WebSocket(relayUrl);
 
+    // 握手超时看门狗：如果 WS open 事件在 20s 内未到达（TCP 连上但 upgrade
+    // 响应丢失——WiFi 恢复期/代理链路抖动时常见），主动 terminate 触发 close
+    // → 重连，避免永久挂死在 CONNECTING 状态（旧逻辑的致命缺陷：startHeartbeat
+    // 只在 registered 后启动，握手挂死时无任何看门狗看管新连接）。
+    const handshakeTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) {
+        log.log?.('[agent] handshake timeout (20s, no WS open), forcing reconnect');
+        try { ws.terminate(); } catch (eT) {}
+      }
+    }, 20000);
+
     ws.on('open', () => {
+      clearTimeout(handshakeTimer);
       log.log?.('[agent] Connected to relay');
       send(ws, { type: 'register', token, version });
     });
@@ -545,6 +557,8 @@ export function startAgent(opts) {
     });
 
     ws.on('close', (code, reason) => {
+      clearTimeout(handshakeTimer);
+      if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
       log.log?.(`[agent] Disconnected (${code}): ${reason}`);
       registered = false;
       for (const [, stream] of streams) {
@@ -560,6 +574,7 @@ export function startAgent(opts) {
     });
 
     ws.on('error', (err) => {
+      clearTimeout(handshakeTimer);
       log.error?.(`[agent] WS Error: ${err.message}`);
       ws.close();
     });
