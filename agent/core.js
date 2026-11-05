@@ -19,8 +19,93 @@ const WS_SEND_HIGH_WATER = parseInt(process.env.WS_SEND_HIGH_WATER || String(8 *
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
 
+const IGNORE_IFACE_RE = /^(lo|docker\d*|br-[0-9a-f]+|veth[0-9a-f]+|virbr\d*|cni\d*|flannel\d*)$/i;
+const TRANSPARENT_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+
+/**
+ * Enumerate and classify all candidate IPv4 addresses for intranet direct probing.
+ * Excludes loopback, internal interfaces, Docker bridges, container veths,
+ * sing-box/clash virtual tun interfaces (e.g. 172.18.0.1), and public WAN IPs.
+ * Categorizes EasyTier (10.144.x.x), Tailscale (100.64-127.x.x), and LAN (192.168.x.x, 10.x.x.x).
+ * @returns {Array<{ip: string, name: string, type: 'lan'|'vpn', desc: string, prio: number}>}
+ */
+export function collectCandidateIpv4s() {
+  const list = [];
+  const seenIps = new Set();
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const [name, addrs] of Object.entries(ifaces)) {
+      if (IGNORE_IFACE_RE.test(name)) continue;
+      for (const a of addrs || []) {
+        if (a.family !== 'IPv4' || a.internal) continue;
+        const ip = a.address;
+        if (!ip || ip.startsWith('127.') || ip.startsWith('169.254.') || ip === '0.0.0.0') continue;
+        if (seenIps.has(ip)) continue;
+
+        // 1. Identify virtual tun/tap interfaces
+        const isTunTap = /^(tun|tap|utun)/i.test(name);
+        const isEasyTier = ip.startsWith('10.144.') || /easytier/i.test(name);
+        const isTailscale = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip) || /tailscale/i.test(name);
+
+        // If it's a tun/tap interface but NOT a recognized mesh VPN, it is a local proxy
+        // (e.g. sing-box/clash fake-ip or 172.18.0.1 tun) -> STRICTLY EXCLUDE.
+        if (isTunTap && !isEasyTier && !isTailscale) {
+          continue;
+        }
+
+        // 2. Filter out 172.16.0.0/12 (Docker networks, sing-box tun endpoints)
+        if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) {
+          continue;
+        }
+
+        let type = null;
+        let desc = name;
+        let prio = 99;
+
+        if (isEasyTier) {
+          type = 'vpn';
+          desc = 'EasyTier 专网';
+          prio = 1; // Prioritize mesh VPN across heterogeneous networks
+        } else if (isTailscale) {
+          type = 'vpn';
+          desc = 'Tailscale 专网';
+          prio = 1;
+        } else if (ip.startsWith('192.168.')) {
+          type = 'lan';
+          desc = '物理局域网 (192.168.x)';
+          prio = 2;
+        } else if (ip.startsWith('10.')) {
+          type = 'lan';
+          desc = '私有内网 (10.x)';
+          prio = 3;
+        } else {
+          // Public WAN IPs MUST NEVER be reported as intranet direct probe candidates!
+          continue;
+        }
+
+        seenIps.add(ip);
+        list.push({ ip, name, type, desc, prio });
+      }
+    }
+  } catch {}
+
+  // Explicit override or additional candidate IPs via env var
+  const envCandidates = (process.env.DSH_CANDIDATE_IPS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  for (const raw of envCandidates) {
+    if (!seenIps.has(raw) && /^(\d{1,3}\.){3}\d{1,3}$/.test(raw)) {
+      seenIps.add(raw);
+      list.unshift({ ip: raw, name: 'env', type: 'lan', desc: '指定内网地址', prio: 0 });
+    }
+  }
+
+  list.sort((a, b) => a.prio - b.prio);
+  return list;
+}
+
 /** First non-internal IPv4 of this host (for the dashboard), or null. */
 function localIPv4() {
+  const c = collectCandidateIpv4s();
+  if (c.length > 0) return c[0].ip;
   try {
     for (const addrs of Object.values(os.networkInterfaces())) {
       for (const a of addrs || []) {
@@ -242,20 +327,28 @@ function detectDshMetadata() {
 }
 
 /** Collect local system info for the relay dashboard. */
-export function collectSystemInfo(defaultVersion) {
+export function collectSystemInfo(defaultVersion, lanBridgeInfo = null) {
   const disks = collectDisks();
   const diskTotal = disks.reduce((a, d) => a + d.total, 0);
   const diskUsed = disks.reduce((a, d) => a + d.used, 0);
   const diskFree = disks.reduce((a, d) => a + d.free, 0);
   const cpus = os.cpus();
   const meta = detectDshMetadata();
+  const candidates = collectCandidateIpv4s();
+  const bridgePort = lanBridgeInfo?.port || parseInt(process.env.LAN_BRIDGE_PORT || '3088', 10);
+  const bridgeEnabled = lanBridgeInfo ? lanBridgeInfo.enabled : process.env.LAN_BRIDGE_ENABLED !== '0';
   return {
     instanceId: getEffectiveInstanceId(),
     hostname: os.hostname(),
     platform: os.platform(),
     release: os.release(),
     arch: os.arch(),
-    ip: localIPv4(),
+    ip: candidates[0]?.ip || localIPv4(),
+    network: {
+      bridgePort,
+      bridgeEnabled,
+      candidates,
+    },
     cpuModel: cpus[0]?.model || '',
     cpuCores: cpus.length,
     loadAvg: os.loadavg(),
@@ -348,6 +441,244 @@ export function normalizeServices(raw, log) {
 }
 
 /**
+ * Start lightweight LAN bridge listener for browser probing and direct LAN offloading.
+ * - Handles /__dsh_probe.gif and /__dsh_probe with CORS + Private Network Access headers.
+ * - Reverse proxies all other requests to local DSH (127.0.0.1:3080) rewriting Host/Origin.
+ * - Forwards WebSocket upgrades cleanly.
+ */
+export function startLanBridge({
+  port = 3088,
+  dshHost = '127.0.0.1',
+  dshPort = 3080,
+  getInstanceId: getInstId = getInstanceId,
+  getWebToken = null,
+  getAuthCookie = null,
+  mintAuthCookie = null,
+  log = console,
+}) {
+  let isListening = false;
+  // Track authenticated client IPs with expiration (7 days)
+  const authenticatedClients = new Map();
+
+  function isClientAuthed(ip, cookieHeader = '') {
+    if (cookieHeader.includes('dsh-auth-') || cookieHeader.includes('dsh_lan_auth=1')) {
+      return true;
+    }
+    const exp = authenticatedClients.get(ip);
+    if (exp && exp > Date.now()) {
+      return true;
+    }
+    return false;
+  }
+
+  function markClientAuthed(ip) {
+    if (ip) {
+      authenticatedClients.set(ip, Date.now() + 7 * 86400000);
+      if (authenticatedClients.size > 1000) {
+        const now = Date.now();
+        for (const [k, v] of authenticatedClients) {
+          if (v <= now) authenticatedClients.delete(k);
+        }
+      }
+    }
+  }
+
+  const server = http.createServer((req, res) => {
+    // CORS + PNA headers for modern browser cross-network access
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const rawUrl = req.url || '/';
+    const pathOnly = rawUrl.split('?')[0];
+
+    // 1. Lightweight probe image for PNA / Mixed Content bypass
+    if (pathOnly === '/__dsh_probe.gif') {
+      res.setHeader('Content-Type', 'image/gif');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.writeHead(200);
+      res.end(TRANSPARENT_GIF);
+      return;
+    }
+
+    // 2. JSON probe endpoint
+    if (pathOnly === '/__dsh_probe') {
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        instanceId: getInstId ? getInstId() : null,
+        hostname: os.hostname(),
+        ts: Date.now(),
+      }));
+      return;
+    }
+
+    const clientIp = req.socket?.remoteAddress;
+    const incomingCookie = req.headers.cookie || '';
+
+    // Check if request query contains a launch/direct token
+    let hasValidTokenInQuery = false;
+    let queryToken = null;
+    try {
+      const u = new URL(rawUrl, 'http://127.0.0.1');
+      queryToken = u.searchParams.get('token');
+      const activeToken = getWebToken ? getWebToken() : null;
+      if (queryToken && activeToken && queryToken === activeToken) {
+        hasValidTokenInQuery = true;
+        markClientAuthed(clientIp);
+      }
+    } catch {}
+
+    const clientAuthed = hasValidTokenInQuery || isClientAuthed(clientIp, incomingCookie);
+
+    // 3. Reverse proxy to local dsh on 127.0.0.1:3080
+    const dshHeaders = { ...req.headers };
+    dshHeaders.host = `${dshHost}:${dshPort}`;
+    if (dshHeaders.origin) {
+      dshHeaders.origin = `http://${dshHost}:${dshPort}`;
+    }
+    if (clientIp) {
+      dshHeaders['x-forwarded-for'] = clientIp;
+    }
+
+    // Auth injection: If request lacks dsh-auth- cookie, but client is authenticated
+    // (via token exchange, dsh_lan_auth cookie, or client IP match),
+    // inject active authCookie so local DSH never 401s on browser cross-origin redirects
+    const currentAuthCookie = getAuthCookie ? getAuthCookie() : null;
+    if (!incomingCookie.includes('dsh-auth-') && clientAuthed && currentAuthCookie) {
+      dshHeaders.cookie = incomingCookie ? `${incomingCookie}; ${currentAuthCookie}` : currentAuthCookie;
+    }
+
+    const dshReq = http.request(
+      `http://${dshHost}:${dshPort}${rawUrl}`,
+      {
+        method: req.method,
+        headers: dshHeaders,
+      },
+      (dshRes) => {
+        const resHeaders = { ...dshRes.headers };
+
+        // Rewrite Set-Cookie: SameSite=Strict -> SameSite=Lax
+        // Also attach dsh_lan_auth cookie if client is authenticated
+        const sc = resHeaders['set-cookie'];
+        if (sc) {
+          const list = Array.isArray(sc) ? sc : [sc];
+          const rewritten = list.map((c) => c.replace(/;\s*SameSite=Strict/i, '; SameSite=Lax'));
+          if (clientAuthed) {
+            rewritten.push('dsh_lan_auth=1; Path=/; SameSite=Lax; Max-Age=2592000');
+          }
+          resHeaders['set-cookie'] = rewritten;
+        } else if (hasValidTokenInQuery || clientAuthed) {
+          resHeaders['set-cookie'] = ['dsh_lan_auth=1; Path=/; SameSite=Lax; Max-Age=2592000'];
+        }
+
+        if (dshRes.statusCode === 401 && mintAuthCookie) {
+          mintAuthCookie().catch(() => {});
+        }
+
+        res.writeHead(dshRes.statusCode, resHeaders);
+        dshRes.pipe(res);
+      }
+    );
+
+    dshReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(`LAN Bridge Error: unable to connect to local DSH at ${dshHost}:${dshPort} (${err.message})`);
+      }
+    });
+
+    req.pipe(dshReq);
+  });
+
+  // Handle WebSocket Upgrade (e.g. terminals, RPC streams)
+  server.on('upgrade', (req, socket, head) => {
+    const clientIp = req.socket?.remoteAddress;
+    const incomingCookie = req.headers.cookie || '';
+    const dshHeaders = { ...req.headers };
+    dshHeaders.host = `${dshHost}:${dshPort}`;
+    if (dshHeaders.origin) {
+      dshHeaders.origin = `http://${dshHost}:${dshPort}`;
+    }
+
+    const currentAuthCookie = getAuthCookie ? getAuthCookie() : null;
+    const clientAuthed = isClientAuthed(clientIp, incomingCookie);
+    if (!incomingCookie.includes('dsh-auth-') && (clientAuthed || currentAuthCookie) && currentAuthCookie) {
+      dshHeaders.cookie = incomingCookie ? `${incomingCookie}; ${currentAuthCookie}` : currentAuthCookie;
+    }
+
+    const proxyReq = http.request({
+      hostname: dshHost,
+      port: dshPort,
+      path: req.url,
+      method: req.method,
+      headers: dshHeaders,
+    });
+
+    proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+      let rawHeaders = `HTTP/1.1 101 Switching Protocols\r\n`;
+      for (const [k, v] of Object.entries(proxyRes.headers)) {
+        if (Array.isArray(v)) {
+          for (const item of v) rawHeaders += `${k}: ${item}\r\n`;
+        } else {
+          rawHeaders += `${k}: ${v}\r\n`;
+        }
+      }
+      rawHeaders += '\r\n';
+      socket.write(rawHeaders);
+
+      if (proxyHead && proxyHead.length) socket.write(proxyHead);
+      if (head && head.length) proxySocket.write(head);
+
+      proxySocket.pipe(socket);
+      socket.pipe(proxySocket);
+
+      proxySocket.on('error', () => socket.destroy());
+      socket.on('error', () => proxySocket.destroy());
+    });
+
+    proxyReq.on('error', (err) => {
+      log.warn?.(`[lan-bridge] WS upgrade to ${dshHost}:${dshPort} error: ${err.message}`);
+      socket.destroy();
+    });
+
+    proxyReq.end();
+  });
+
+  server.on('error', (err) => {
+    isListening = false;
+    log.warn?.(`[lan-bridge] Failed to bind 0.0.0.0:${port}: ${err.message}`);
+  });
+
+  try {
+    server.listen(port, '0.0.0.0', () => {
+      isListening = true;
+      log.log?.(`[lan-bridge] Listening on 0.0.0.0:${port} -> proxying to ${dshHost}:${dshPort}`);
+    });
+  } catch (err) {
+    log.warn?.(`[lan-bridge] Failed to start listener: ${err.message}`);
+  }
+
+  return {
+    server,
+    port,
+    get enabled() { return isListening && server.listening; },
+    close() {
+      try { server.close(); } catch {}
+    },
+  };
+}
+
+/**
  * Start the agent connection loop.
  * @param {object} opts
  * @param {string} opts.token        agent registration token
@@ -375,6 +706,63 @@ export function startAgent(opts) {
 
   const svcList = normalizeServices(services, log);
   const svcMap = new Map(svcList.map((s) => [s.id, s]));
+  // 单业务配置管理（门户托管）：宿主显式开启 remoteServices 才接受 relay 下发的
+  // 'services:config'；下发项与本机声明走同一 normalizeServices 白名单，且只允许
+  // auth=open、不接受任何凭据字段；与本机声明同 id 的下发项一律拒绝（本机为准）。
+  const remoteServices = opts.remoteServices === true || process.env.DSH_REMOTE_SERVICES === '1';
+  let managedList = [];
+  let lastApplied = null;
+  function servicesFrame() {
+    const pub = ({ id, name, desc, icon, auth, entry, spa, category }) => ({ id, name, desc, icon, auth, entry, spa, category });
+    return {
+      type: 'services',
+      servicesOnly: process.env.DSH_SERVICES_ONLY === '1' || undefined,
+      capabilities: remoteServices && process.env.DSH_SERVICES_ONLY !== '1' ? { remoteConfig: 1 } : undefined,
+      services: [
+        ...svcList.map((s) => ({ ...pub(s), origin: 'local' })),
+        ...managedList.map((s) => ({ ...pub(s), origin: 'managed' })),
+      ],
+      applied: lastApplied || undefined,
+    };
+  }
+  function applyManagedConfig(raw) {
+    const results = [];
+    const accepted = [];
+    const localIds = new Set(svcList.map((s) => s.id));
+    for (const item of Array.isArray(raw) ? raw.slice(0, 32) : []) {
+      const id = String(item?.id || '');
+      if (localIds.has(id)) { results.push({ id, ok: false, error: '与本机声明的服务同名，以本机为准' }); continue; }
+      const warn = [];
+      const [svc] = normalizeServices([{
+        id, name: item?.name, desc: item?.desc, icon: item?.icon, upstream: item?.upstream,
+        entry: item?.entry, spa: item?.spa === true, auth: 'open',
+      }], { warn: (m) => warn.push(m) });
+      if (!svc) { results.push({ id, ok: false, error: (warn[0] || 'invalid').replace(/^\[agent\] /, '') }); continue; }
+      svc.category = typeof item?.category === 'string' ? item.category.slice(0, 16) : '';
+      accepted.push(svc);
+      results.push({ id, ok: true });
+    }
+    for (const s of managedList) svcMap.delete(s.id);
+    managedList = accepted;
+    for (const s of managedList) svcMap.set(s.id, s);
+    lastApplied = results;
+    log.log?.(`[agent] managed services applied: ${results.map((r) => `${r.id}:${r.ok ? 'ok' : 'rejected'}`).join(', ') || '(none)'}`);
+  }
+  function probeUpstream(ws, msg) {
+    const t0 = Date.now();
+    const reply = (r) => send(ws, { type: 'services:probe-result', reqId: msg.reqId, ms: Date.now() - t0, ...r });
+    const up = parseUpstream(msg.upstream);
+    if (!up) { reply({ ok: false, error: '上游地址格式错误' }); return; }
+    if (!upstreamAllowed(up.host)) { reply({ ok: false, error: `${up.host} 不在实例白名单内（回环 / 10.144.144.0/24 / AGENT_UPSTREAM_ALLOW）` }); return; }
+    const entry = typeof msg.entry === 'string' && msg.entry.startsWith('/') ? msg.entry : '/';
+    const req = http.request({ host: up.host, port: up.port, path: entry, method: 'GET', timeout: 5000, headers: { host: `${up.host}:${up.port}` } }, (res) => {
+      res.resume();
+      reply({ ok: res.statusCode < 500, status: res.statusCode });
+    });
+    req.on('timeout', () => { req.destroy(new Error('连接超时（5s）')); });
+    req.on('error', (e) => reply({ ok: false, error: e.code === 'ECONNREFUSED' ? '连接被拒绝（端口没有服务在监听）' : e.message }));
+    req.end();
+  }
   let relayUsername = null; // set on 'registered'; subject of SSO trust headers
   if (svcList.length) {
     log.log?.(`[agent] plugin services: ${svcList.map((s) => `${s.id}->${s.host}:${s.port}${s.auth === 'sso' ? ' (sso)' : ''}`).join(', ')}`);
@@ -441,7 +829,42 @@ export function startAgent(opts) {
     mintAuthCookie();
   }
 
+  function getActiveWebToken() {
+    if (webToken) return webToken;
+    try {
+      if (fs.existsSync('/var/log/dsh-web.log')) {
+        const content = fs.readFileSync('/var/log/dsh-web.log', 'utf8');
+        const matches = [...content.matchAll(/\?token=([A-Za-z0-9_-]+)/g)];
+        if (matches.length > 0) {
+          return matches[matches.length - 1][1];
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   if (webToken) mintAuthCookie();
+
+  // ── LAN Bridge for local/intranet direct offload & timing-gap probing ──
+  const lanBridgePort = parseInt(process.env.LAN_BRIDGE_PORT || '3088', 10);
+  const lanBridgeEnabled = process.env.LAN_BRIDGE_ENABLED !== '0' && process.env.DSH_SERVICES_ONLY !== '1';
+  let lanBridge = null;
+  if (lanBridgeEnabled) {
+    try {
+      lanBridge = startLanBridge({
+        port: lanBridgePort,
+        dshHost,
+        dshPort,
+        getInstanceId: getEffectiveInstanceId,
+        getWebToken: getActiveWebToken,
+        getAuthCookie: () => authCookie,
+        mintAuthCookie,
+        log,
+      });
+    } catch (e) {
+      log.warn?.(`[agent] Failed to initialize LAN bridge: ${e.message}`);
+    }
+  }
 
   const streams = new Map();
   let registered = false;
@@ -484,19 +907,51 @@ export function startAgent(opts) {
         reconnectAttempt = 0;
         relayUsername = msg.username || null;
         log.log?.(`[agent] Registered as ${msg.username} (session ${msg.sessionId || ''})`);
-        send(ws, { type: 'system-info', info: collectSystemInfo(dshVersion) });
+        send(ws, {
+          type: 'system-info',
+          info: collectSystemInfo(dshVersion, {
+            port: lanBridgePort,
+            enabled: lanBridge ? lanBridge.enabled : false,
+          }),
+        });
         // 插件工作区：上报本实例声明的服务清单（relay 存实例维度，供 /p 路由校验）
         // DSH_SERVICES_ONLY=1：独立 services agent，relay 不注册主实例（服务旁挂到同机 dsh 实例）
-        send(ws, {
-          type: 'services',
-          servicesOnly: process.env.DSH_SERVICES_ONLY === '1' || undefined,
-          services: svcList.map(({ id, name, desc, icon, auth, entry, spa }) => ({ id, name, desc, icon, auth, entry, spa })),
-        });
+        send(ws, servicesFrame());
         startHeartbeat(ws);
         return;
       }
 
       if (msg.type === 'heartbeat') return;
+
+      // 直连免密换票请求响应
+      if (msg.type === 'lan-ticket:request') {
+        const activeToken = getActiveWebToken();
+        if (!authCookie && activeToken) {
+          mintAuthCookie().catch(() => {});
+        }
+        send(ws, {
+          type: 'lan-ticket:response',
+          reqId: msg.reqId,
+          ok: true,
+          token: activeToken || '',
+          bridgePort: lanBridgePort,
+          bridgeEnabled: lanBridge ? lanBridge.enabled : false,
+        });
+        return;
+      }
+
+      // 门户托管业务下发（仅宿主开启 remoteServices 时接受）
+      if (msg.type === 'services:config') {
+        if (!remoteServices) { log.warn?.('[agent] services:config ignored (remoteServices disabled)'); return; }
+        applyManagedConfig(msg.services);
+        send(ws, servicesFrame());
+        return;
+      }
+      if (msg.type === 'services:probe') {
+        if (!remoteServices) { send(ws, { type: 'services:probe-result', reqId: msg.reqId, ok: false, error: 'remoteServices disabled' }); return; }
+        probeUpstream(ws, msg);
+        return;
+      }
 
       if (msg.type === 'http:request') {
         // [Artifact Viewer] 是 dsh UI 注入脚本的专属旁路；插件流不经过它。
@@ -939,6 +1394,7 @@ export function startAgent(opts) {
     stop() {
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (lanBridge) lanBridge.close();
     },
   };
 }
