@@ -940,6 +940,12 @@ export function startAgent(opts) {
         return;
       }
 
+      // WebRTC P2P 穿透打洞信令交互
+      if (msg.type === 'webrtc:signal') {
+        handleWebRtcSignalMessage(ws, msg);
+        return;
+      }
+
       // 门户托管业务下发（仅宿主开启 remoteServices 时接受）
       if (msg.type === 'services:config') {
         if (!remoteServices) { log.warn?.('[agent] services:config ignored (remoteServices disabled)'); return; }
@@ -1386,6 +1392,305 @@ export function startAgent(opts) {
     streams.set(streamId, { dshWs, pending });
   }
 
+  // ── WebRTC P2P Hole Punching Engine (werift) ──────────────────────
+  let weriftModule = null;
+  async function loadWerift() {
+    if (weriftModule) return weriftModule;
+    try {
+      weriftModule = await import('werift');
+      return weriftModule;
+    } catch (e) {
+      log.warn?.(`[agent] werift WebRTC module load failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  const activeRtcPeers = new Map(); // clientId -> { pc, dc, wsStreams }
+
+  async function handleWebRtcSignalMessage(ws, msg) {
+    const { reqId, signalType, sdp, candidate, clientId = 'default' } = msg;
+    if (signalType === 'offer') {
+      const werift = await loadWerift();
+      if (!werift || !werift.RTCPeerConnection) {
+        send(ws, {
+          type: 'webrtc:signal-response',
+          reqId,
+          ok: false,
+          error: '宿主机未安装或加载 werift WebRTC 模块',
+        });
+        return;
+      }
+
+      // 确保本地 Auth Cookie 就绪
+      if (!authCookie && webToken) {
+        try { await mintAuthCookie(); } catch {}
+      }
+
+      try {
+        const existing = activeRtcPeers.get(clientId);
+        if (existing) {
+          try { existing.pc.close(); } catch {}
+          activeRtcPeers.delete(clientId);
+        }
+
+        const pc = new werift.RTCPeerConnection({
+          iceServers: [
+            { urls: 'stun:stun.cloudflare.com:3478' },
+            { urls: 'stun:stun.l.google.com:19302' },
+          ],
+        });
+
+        const peer = {
+          clientId,
+          pc,
+          dc: null,
+          wsStreams: new Map(),
+        };
+        activeRtcPeers.set(clientId, peer);
+
+        pc.ondatachannel = (event) => {
+          const dc = event.channel;
+          peer.dc = dc;
+          log.log?.(`[agent-webrtc] DataChannel opened (${dc.label}) for client ${clientId}`);
+
+          dc.onmessage = (e) => {
+            handleRtcDataChannelMessage(peer, dc, e.data);
+          };
+
+          dc.onclose = () => {
+            log.log?.(`[agent-webrtc] DataChannel closed for client ${clientId}`);
+            for (const [, sWs] of peer.wsStreams) {
+              try { sWs.close(); } catch {}
+            }
+            peer.wsStreams.clear();
+            activeRtcPeers.delete(clientId);
+          };
+
+          dc.onerror = (err) => {
+            log.warn?.(`[agent-webrtc] DataChannel error: ${err.message}`);
+          };
+        };
+
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+
+        // 等待 ICE 候选收集（嵌入至 localDescription 中返回，单次 RTT 快速握手）
+        await new Promise((resolve) => {
+          if (pc.iceGatheringState === 'complete') return resolve();
+          const timer = setTimeout(resolve, 800);
+          pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') {
+              clearTimeout(timer);
+              resolve();
+            }
+          };
+        });
+
+        send(ws, {
+          type: 'webrtc:signal-response',
+          reqId,
+          ok: true,
+          signalType: 'answer',
+          sdp: pc.localDescription.sdp,
+        });
+      } catch (err) {
+        log.warn?.(`[agent-webrtc] Offer 协商异常: ${err.message}`);
+        send(ws, {
+          type: 'webrtc:signal-response',
+          reqId,
+          ok: false,
+          error: err.message,
+        });
+      }
+      return;
+    }
+
+    if (signalType === 'candidate') {
+      const peer = activeRtcPeers.get(clientId);
+      if (peer && peer.pc && candidate) {
+        try { await peer.pc.addIceCandidate(candidate); } catch {}
+      }
+      send(ws, { type: 'webrtc:signal-response', reqId, ok: true });
+      return;
+    }
+  }
+
+  function handleRtcDataChannelMessage(peer, dc, raw) {
+    let msg;
+    try {
+      msg = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+    } catch {
+      return;
+    }
+
+    if (!msg || !msg.type) return;
+
+    // 1. P2P 测速与探测 (Ping / Pong)
+    if (msg.type === 'ping') {
+      try {
+        dc.send(JSON.stringify({
+          type: 'pong',
+          reqId: msg.reqId,
+          ts: msg.ts,
+          agentTs: Date.now(),
+          instanceId: getEffectiveInstanceId(),
+          hostname: os.hostname(),
+        }));
+      } catch {}
+      return;
+    }
+
+    // 2. HTTP 虚拟流转发
+    if (msg.type === 'http:request') {
+      const { streamId, method = 'GET', url = '/', headers = {}, body } = msg;
+      const targetHeaders = { ...headers };
+      targetHeaders.host = `${dshHost}:${dshPort}`;
+      targetHeaders.origin = `http://${dshHost}:${dshPort}`;
+      if (authCookie) targetHeaders.cookie = authCookie;
+      delete targetHeaders['content-length'];
+
+      const dshReq = http.request(`http://${dshHost}:${dshPort}${url}`, {
+        method,
+        headers: targetHeaders,
+      }, (dshRes) => {
+        const resHeaders = { ...dshRes.headers };
+        const sc = resHeaders['set-cookie'];
+        if (sc) {
+          const list = Array.isArray(sc) ? sc : [sc];
+          resHeaders['set-cookie'] = list.map(c => c.replace(/;\s*SameSite=Strict/i, '; SameSite=Lax'));
+        }
+
+        try {
+          dc.send(JSON.stringify({
+            type: 'http:response',
+            streamId,
+            status: dshRes.statusCode,
+            headers: resHeaders,
+          }));
+        } catch {}
+
+        dshRes.on('data', (chunk) => {
+          try {
+            dc.send(JSON.stringify({
+              type: 'http:chunk',
+              streamId,
+              data: chunk.toString('base64'),
+            }));
+          } catch {}
+        });
+
+        dshRes.on('end', () => {
+          try {
+            dc.send(JSON.stringify({ type: 'http:end', streamId }));
+          } catch {}
+        });
+      });
+
+      dshReq.on('error', (err) => {
+        try {
+          dc.send(JSON.stringify({
+            type: 'http:response',
+            streamId,
+            status: 502,
+            headers: { 'content-type': 'text/plain' },
+          }));
+          dc.send(JSON.stringify({
+            type: 'http:chunk',
+            streamId,
+            data: Buffer.from(`DSH WebRTC proxy error: ${err.message}`).toString('base64'),
+          }));
+          dc.send(JSON.stringify({ type: 'http:end', streamId }));
+        } catch {}
+      });
+
+      if (body) {
+        dshReq.write(Buffer.from(body, 'base64'));
+      }
+      dshReq.end();
+      return;
+    }
+
+    // 3. WebSocket 虚拟流转发 (终端 / RPC)
+    if (msg.type === 'ws:open') {
+      const { streamId, url = '/api/remote.mux' } = msg;
+      const wsHeaders = {
+        host: `${dshHost}:${dshPort}`,
+        origin: `http://${dshHost}:${dshPort}`,
+      };
+      if (authCookie) wsHeaders.cookie = authCookie;
+
+      const dshWs = new WebSocket(`ws://${dshHost}:${dshPort}${url}`, {
+        headers: wsHeaders,
+      });
+
+      peer.wsStreams.set(streamId, dshWs);
+
+      dshWs.on('open', () => {
+        try {
+          dc.send(JSON.stringify({ type: 'ws:opened', streamId }));
+        } catch {}
+      });
+
+      dshWs.on('message', (data, isBinary) => {
+        try {
+          dc.send(JSON.stringify({
+            type: 'ws:message',
+            streamId,
+            data: isBinary ? data.toString('base64') : data.toString(),
+            binary: !!isBinary,
+          }));
+        } catch {}
+      });
+
+      dshWs.on('close', (code, reason) => {
+        peer.wsStreams.delete(streamId);
+        try {
+          dc.send(JSON.stringify({
+            type: 'ws:close',
+            streamId,
+            code,
+            reason: reason?.toString(),
+          }));
+        } catch {}
+      });
+
+      dshWs.on('error', (err) => {
+        try {
+          dc.send(JSON.stringify({
+            type: 'ws:error',
+            streamId,
+            message: err.message,
+          }));
+        } catch {}
+      });
+      return;
+    }
+
+    if (msg.type === 'ws:message') {
+      const { streamId, data, binary } = msg;
+      const dshWs = peer.wsStreams.get(streamId);
+      if (dshWs && dshWs.readyState === WebSocket.OPEN) {
+        if (binary) {
+          dshWs.send(Buffer.from(data, 'base64'), { binary: true });
+        } else {
+          dshWs.send(data);
+        }
+      }
+      return;
+    }
+
+    if (msg.type === 'ws:close') {
+      const { streamId, code, reason } = msg;
+      const dshWs = peer.wsStreams.get(streamId);
+      if (dshWs) {
+        try { dshWs.close(code, reason); } catch {}
+        peer.wsStreams.delete(streamId);
+      }
+      return;
+    }
+  }
+
   connect();
 
   return {
@@ -1395,6 +1700,10 @@ export function startAgent(opts) {
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (lanBridge) lanBridge.close();
+      for (const [, peer] of activeRtcPeers) {
+        try { peer.pc.close(); } catch {}
+      }
+      activeRtcPeers.clear();
     },
   };
 }
