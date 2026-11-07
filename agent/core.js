@@ -336,7 +336,7 @@ export function collectSystemInfo(defaultVersion, lanBridgeInfo = null) {
   const meta = detectDshMetadata();
   const candidates = collectCandidateIpv4s();
   const bridgePort = lanBridgeInfo?.port || parseInt(process.env.LAN_BRIDGE_PORT || '3088', 10);
-  const bridgeEnabled = lanBridgeInfo ? lanBridgeInfo.enabled : process.env.LAN_BRIDGE_ENABLED !== '0';
+  const bridgeEnabled = lanBridgeInfo ? lanBridgeInfo.enabled : process.env.LAN_BRIDGE_ENABLED === '1';
   return {
     instanceId: getEffectiveInstanceId(),
     hostname: os.hostname(),
@@ -845,9 +845,9 @@ export function startAgent(opts) {
 
   if (webToken) mintAuthCookie();
 
-  // ── LAN Bridge for local/intranet direct offload & timing-gap probing ──
+  // ── LAN Bridge deprecated in favor of secure WebRTC P2P (default disabled) ──
   const lanBridgePort = parseInt(process.env.LAN_BRIDGE_PORT || '3088', 10);
-  const lanBridgeEnabled = process.env.LAN_BRIDGE_ENABLED !== '0' && process.env.DSH_SERVICES_ONLY !== '1';
+  const lanBridgeEnabled = process.env.LAN_BRIDGE_ENABLED === '1' && process.env.DSH_SERVICES_ONLY !== '1';
   let lanBridge = null;
   if (lanBridgeEnabled) {
     try {
