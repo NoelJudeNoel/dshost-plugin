@@ -19,6 +19,15 @@ const WS_SEND_HIGH_WATER = parseInt(process.env.WS_SEND_HIGH_WATER || String(8 *
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
 
+// SCTP 单帧上限（a=max-message-size）。Chrome 通告 256KB，werift 默认 64KB，
+// 超限的帧会被对端 SCTP 静默丢弃——P2P 下表现为会话快照缺失、长会话打不开。
+// 应用层分片：32KB 原始字节 → base64 约 43.8KB，两端上限都吃得下。
+const DC_CHUNK_RAW_BYTES = 32 * 1024;
+const DC_CHUNK_MAX_TOTAL = 8192;              // 8192 × 32KB ≈ 256MB 理论封顶
+const DC_CHUNK_MAX_BYTES = 32 * 1024 * 1024;  // 单条消息重组上限 32MB
+const DC_CHUNK_TTL_MS = 30000;                // 半截消息 30s 后清理
+let dcChunkSeq = 0;
+
 const IGNORE_IFACE_RE = /^(lo|docker\d*|br-[0-9a-f]+|veth[0-9a-f]+|virbr\d*|cni\d*|flannel\d*)$/i;
 const TRANSPARENT_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 
@@ -1556,6 +1565,7 @@ export function startAgent(opts) {
     const peer = activeRtcPeers.get(clientId);
     if (!peer) return false;
     flushUsage(peer);
+    if (peer.chunks) peer.chunks.clear();
     try { peer.pc.close(); } catch {}
     if (peer.usage.heartbeat) clearInterval(peer.usage.heartbeat);
     activeRtcPeers.delete(clientId);
@@ -1597,6 +1607,8 @@ export function startAgent(opts) {
           httpReqs: new Map(),
           nonce: typeof msg.peerNonce === 'string' ? msg.peerNonce : '',
           authed: !msg.peerNonce,
+          features: new Set(),
+          chunks: new Map(),
           usage: { up: 0, down: 0, timer: null },
         };
         activeRtcPeers.set(clientId, peer);
@@ -1609,6 +1621,18 @@ export function startAgent(opts) {
           dc.onmessage = (e) => {
             handleRtcDataChannelMessage(peer, dc, e.data);
           };
+
+          // 能力通告：告诉浏览器本端支持应用层分片，并给出本端 SCTP 上限。
+          // 浏览器只有声明 features 含 'chunk' 时本端才分片，老垫片不受影响。
+          announceDcFeatures(peer, dc);
+
+          // 发送诊断：dc.send 抛错（超过 peer 的 max-message-size、通道半闭）
+          // 以前被 try/catch 静默吞掉，浏览器侧只表现为丢帧。这里至少留日志。
+          log.log?.(
+            `[agent-webrtc] dc limits for ${clientId}: remoteMaxMessageSize=`
+            + `${pc.sctp ? pc.sctp.remoteMaxMessageSize : '?'} localMaxMessageSize=`
+            + `${pc.sctp ? pc.sctp.maxMessageSize : '?'}`,
+          );
 
           // 首帧必须是 auth。5s 内未认证就直接断开，避免半开连接长期挂着。
           if (!peer.authed) {
@@ -1642,6 +1666,7 @@ export function startAgent(opts) {
               try { req.destroy(); } catch {}
             }
             peer.httpReqs.clear();
+            if (peer.chunks) peer.chunks.clear();
             flushUsage(peer);
             if (peer.usage.timer) clearInterval(peer.usage.timer);
             if (peer.usage.heartbeat) clearInterval(peer.usage.heartbeat);
@@ -1704,6 +1729,131 @@ export function startAgent(opts) {
     }
   }
 
+  // ── DataChannel 发送：按能力分片 ───────────────────────────────────────
+  // 本端与对端的 SCTP max-message-size 取小值；超过就切块，只有对端声明
+  // features:['chunk'] 才切（否则保持旧行为并记日志，便于发现老垫片）。
+  function dcMaxMessage(peer) {
+    const sctp = peer && peer.pc ? peer.pc.sctp : null;
+    const local = sctp && Number.isFinite(sctp.maxMessageSize) ? sctp.maxMessageSize : 65536;
+    const remote = sctp && Number.isFinite(sctp.remoteMaxMessageSize) ? sctp.remoteMaxMessageSize : local;
+    return Math.max(4096, Math.min(local, remote));
+  }
+
+  function announceDcFeatures(peer, dc) {
+    if (!dc || dc.readyState !== 'open') return;
+    try {
+      dc.send(JSON.stringify({
+        type: 'hello',
+        features: ['chunk'],
+        maxMessageSize: dcMaxMessage(peer),
+      }));
+    } catch {}
+  }
+
+  function dcSend(peer, dc, obj) {    if (!dc || dc.readyState !== 'open') return false;
+    let text;
+    try {
+      text = typeof obj === 'string' ? obj : JSON.stringify(obj);
+    } catch {
+      return false;
+    }
+    // max-message-size 是应用层 payload 上限；留 1KB 余量，避免贴着边界。
+    const limit = dcMaxMessage(peer) - 1024;
+    // UTF-8 字节数 >= UTF-16 长度，先在便宜的一侧判定。
+    if (text.length * 3 <= limit) {
+      try { dc.send(text); return true; } catch (e) {
+        log.warn?.(`[agent-webrtc] dc.send failed (${text.length}B): ${e && e.message}`);
+        return false;
+      }
+    }
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes <= limit) {
+      try { dc.send(text); return true; } catch (e) {
+        log.warn?.(`[agent-webrtc] dc.send failed (${bytes}B): ${e && e.message}`);
+        return false;
+      }
+    }
+    if (!peer.features || !peer.features.has('chunk')) {
+      log.warn?.(
+        `[agent-webrtc] dropped ${bytes}B frame (limit ${limit}B): peer does not support chunking`,
+      );
+      return false;
+    }
+    return dcSendChunked(dc, text);
+  }
+
+  function dcSendChunked(dc, text) {
+    const buf = Buffer.from(text, 'utf8');
+    const total = Math.ceil(buf.length / DC_CHUNK_RAW_BYTES);
+    if (total > DC_CHUNK_MAX_TOTAL) {
+      log.warn?.(`[agent-webrtc] refusing to chunk ${buf.length}B into ${total} frames`);
+      return false;
+    }
+    const id = 'c' + (++dcChunkSeq);
+    for (let i = 0; i < total; i++) {
+      const slice = buf.subarray(i * DC_CHUNK_RAW_BYTES, Math.min((i + 1) * DC_CHUNK_RAW_BYTES, buf.length));
+      const frame = JSON.stringify({
+        type: 'dc:chunk',
+        id,
+        seq: i,
+        total,
+        data: slice.toString('base64'),
+      });
+      try {
+        dc.send(frame);
+      } catch (e) {
+        log.warn?.(
+          `[agent-webrtc] chunk ${i + 1}/${total} send failed (${slice.length}B): ${e && e.message}`,
+        );
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function prunePeerChunks(peer, now) {
+    if (!peer.chunks || peer.chunks.size === 0) return;
+    for (const [id, slot] of peer.chunks) {
+      if (now - slot.at > DC_CHUNK_TTL_MS) peer.chunks.delete(id);
+    }
+  }
+
+  function acceptRtcChunk(peer, dc, msg) {
+    const id = typeof msg.id === 'string' ? msg.id : '';
+    const seq = msg.seq;
+    const total = msg.total;
+    if (!id || !Number.isInteger(seq) || !Number.isInteger(total)) return;
+    if (total < 1 || total > DC_CHUNK_MAX_TOTAL || seq < 0 || seq >= total) return;
+    const now = Date.now();
+    let slot = peer.chunks.get(id);
+    if (!slot) {
+      slot = { total, parts: new Array(total), got: 0, bytes: 0, at: now };
+      peer.chunks.set(id, slot);
+    } else if (slot.total !== total) {
+      peer.chunks.delete(id);
+      return;
+    }
+    if (slot.parts[seq]) return;   // 幂等：重复分片直接忽略
+    const part = Buffer.from(typeof msg.data === 'string' ? msg.data : '', 'base64');
+    slot.parts[seq] = part;
+    slot.got += 1;
+    slot.bytes += part.length;
+    slot.at = now;
+    if (slot.bytes > DC_CHUNK_MAX_BYTES) {
+      peer.chunks.delete(id);
+      log.warn?.(`[agent-webrtc] dropping oversized chunked message ${id} (>${DC_CHUNK_MAX_BYTES}B)`);
+      return;
+    }
+    if (slot.got === slot.total) {
+      peer.chunks.delete(id);
+      let full = '';
+      try { full = Buffer.concat(slot.parts).toString('utf8'); } catch { return; }
+      handleRtcDataChannelMessage(peer, dc, full);
+      return;
+    }
+    prunePeerChunks(peer, now);
+  }
+
   function handleRtcDataChannelMessage(peer, dc, raw) {
     let msg;
     try {
@@ -1714,32 +1864,41 @@ export function startAgent(opts) {
 
     if (!msg || !msg.type) return;
 
+    // 分片重组：完成后再按普通帧处理（顺序通道，但仍按 seq 落位）。
+    if (msg.type === 'dc:chunk') {
+      acceptRtcChunk(peer, dc, msg);
+      return;
+    }
+
     // 0. 认证门禁：未认证前只接受 auth，其余消息一律丢弃。
     if (!peer.authed) {
       if (msg.type === 'auth' && peer.nonce && msg.nonce === peer.nonce) {
         peer.authed = true;
+        if (Array.isArray(msg.features)) {
+          for (const f of msg.features) if (typeof f === 'string') peer.features.add(f);
+        }
         if (peer.authTimer) { clearTimeout(peer.authTimer); peer.authTimer = null; }
         log.log?.(`[agent-webrtc] client ${peer.clientId} authenticated`);
         if (peer.ws && peer.ws.readyState === 1) {
           try { send(peer.ws, { type: 'webrtc:peer-state', clientId: peer.clientId, state: 'open' }); } catch {}
         }
         reportIceStatsSoon(peer);
+        // 重发能力通告：ondatachannel 时通道可能还没 open，认证后再补一次。
+        announceDcFeatures(peer, dc);
       }
       return;
     }
 
     // 1. P2P 测速与探测 (Ping / Pong)
     if (msg.type === 'ping') {
-      try {
-        dc.send(JSON.stringify({
-          type: 'pong',
-          reqId: msg.reqId,
-          ts: msg.ts,
-          agentTs: Date.now(),
-          instanceId: getEffectiveInstanceId(),
-          hostname: os.hostname(),
-        }));
-      } catch {}
+      dcSend(peer, dc, {
+        type: 'pong',
+        reqId: msg.reqId,
+        ts: msg.ts,
+        agentTs: Date.now(),
+        instanceId: getEffectiveInstanceId(),
+        hostname: os.hostname(),
+      });
       return;
     }
 
@@ -1765,31 +1924,25 @@ export function startAgent(opts) {
           resHeaders['set-cookie'] = list.map(c => c.replace(/;\s*SameSite=Strict/i, '; SameSite=Lax'));
         }
 
-        try {
-          dc.send(JSON.stringify({
-            type: 'http:response',
-            streamId,
-            status: dshRes.statusCode,
-            headers: resHeaders,
-          }));
-        } catch {}
+        dcSend(peer, dc, {
+          type: 'http:response',
+          streamId,
+          status: dshRes.statusCode,
+          headers: resHeaders,
+        });
 
         dshRes.on('data', (chunk) => {
           bump(peer, 'down', chunk.length);
-          try {
-            dc.send(JSON.stringify({
-              type: 'http:chunk',
-              streamId,
-              data: chunk.toString('base64'),
-            }));
-          } catch {}
+          dcSend(peer, dc, {
+            type: 'http:chunk',
+            streamId,
+            data: chunk.toString('base64'),
+          });
         });
 
         dshRes.on('end', () => {
           peer.httpReqs.delete(streamId);
-          try {
-            dc.send(JSON.stringify({ type: 'http:end', streamId }));
-          } catch {}
+          dcSend(peer, dc, { type: 'http:end', streamId });
         });
       });
 
@@ -1797,20 +1950,18 @@ export function startAgent(opts) {
 
       dshReq.on('error', (err) => {
         peer.httpReqs.delete(streamId);
-        try {
-          dc.send(JSON.stringify({
-            type: 'http:response',
-            streamId,
-            status: 502,
-            headers: { 'content-type': 'text/plain' },
-          }));
-          dc.send(JSON.stringify({
-            type: 'http:chunk',
-            streamId,
-            data: Buffer.from(`DSH WebRTC proxy error: ${err.message}`).toString('base64'),
-          }));
-          dc.send(JSON.stringify({ type: 'http:end', streamId }));
-        } catch {}
+        dcSend(peer, dc, {
+          type: 'http:response',
+          streamId,
+          status: 502,
+          headers: { 'content-type': 'text/plain' },
+        });
+        dcSend(peer, dc, {
+          type: 'http:chunk',
+          streamId,
+          data: Buffer.from(`DSH WebRTC proxy error: ${err.message}`).toString('base64'),
+        });
+        dcSend(peer, dc, { type: 'http:end', streamId });
       });
 
       if (body) {
@@ -1848,43 +1999,35 @@ export function startAgent(opts) {
       peer.wsStreams.set(streamId, dshWs);
 
       dshWs.on('open', () => {
-        try {
-          dc.send(JSON.stringify({ type: 'ws:opened', streamId }));
-        } catch {}
+        dcSend(peer, dc, { type: 'ws:opened', streamId });
       });
 
       dshWs.on('message', (data, isBinary) => {
         bump(peer, 'down', isBinary ? data.length : Buffer.byteLength(data, 'utf8'));
-        try {
-          dc.send(JSON.stringify({
-            type: 'ws:message',
-            streamId,
-            data: isBinary ? data.toString('base64') : data.toString(),
-            binary: !!isBinary,
-          }));
-        } catch {}
+        dcSend(peer, dc, {
+          type: 'ws:message',
+          streamId,
+          data: isBinary ? data.toString('base64') : data.toString(),
+          binary: !!isBinary,
+        });
       });
 
       dshWs.on('close', (code, reason) => {
         peer.wsStreams.delete(streamId);
-        try {
-          dc.send(JSON.stringify({
-            type: 'ws:close',
-            streamId,
-            code,
-            reason: reason?.toString(),
-          }));
-        } catch {}
+        dcSend(peer, dc, {
+          type: 'ws:close',
+          streamId,
+          code,
+          reason: reason?.toString(),
+        });
       });
 
       dshWs.on('error', (err) => {
-        try {
-          dc.send(JSON.stringify({
-            type: 'ws:error',
-            streamId,
-            message: err.message,
-          }));
-        } catch {}
+        dcSend(peer, dc, {
+          type: 'ws:error',
+          streamId,
+          message: err.message,
+        });
       });
       return;
     }
