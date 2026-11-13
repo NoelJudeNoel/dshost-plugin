@@ -17,8 +17,36 @@ dsh Web UI from anywhere.*
 - **零公网 IP**：Agent 主动外连中继（`wss://dshost.me/agent`），本机不开任何入站端口
 - **零破坏性多版本兼容**：同时支持 dsh `0.0.1-rc.*` / `0.1.0-rc.*` / `0.1.1-*` ~ `0.1.5-*`
 - **安全**：中继层 Host/Origin 重写遵守 dsh 信任栅栏；`settings.describe` 密钥脱敏下发；
-  生产环境强制 `wss://`
+  生产环境强制 `wss://`；WebRTC 数据面走 DTLS 端到端加密，中继仅见信令
 - **随 dsh 启动**：以 cordis 插件身份随 `dsh web` 加载，自动重连、休眠省流
+
+## 传输模式
+
+`dshost-plugin ≥ 0.1.22` 搭配最新 dshost.me 中继时，浏览器与本机 dsh 自动选择链路（无感回落）：
+
+- **WebRTC P2P 直连（默认优先）**：浏览器 ↔ Agent 一条 DataChannel（DTLS 端到端加密）直传
+  `/api/*` 流量；中继仅交换 SDP 信令、读不到明文。对称 NAT 打洞失败自动回落加密中继
+- **局域网 / VPN（EasyTier · Tailscale）自动直连**：同一 WiFi / 局域网 / mesh 网段可达时，
+  自动走 WebRTC host 候选直连（0 中继流量，通常 <5ms），无需任何配置
+- **公网中继（自动回退）**：TLS + WSS（dshost.me 边缘节点），任意网络可达
+
+手动控制：URL 参数 `transport=webrtc` 只走 P2P（失败即断开，不偷偷降级）；
+`transport=relay` 强制只走中继；缺省 = 自动。单活跃浏览器规则（仅最近活跃浏览器
+保留实时流）在 P2P 模式下同样生效。
+
+*Transport modes (plugin ≥ 0.1.22, with the current dshost.me relay).*
+
+- **WebRTC P2P (preferred, automatic)**: browser ↔ agent DataChannel (DTLS E2E)
+  carries `/api/*`; the relay only exchanges SDP and cannot read payloads.
+  Hole-punch failure falls back to the encrypted relay transparently.
+- **LAN / VPN (EasyTier · Tailscale) direct**: when the browser and the instance
+  share a reachable LAN/mesh segment, ICE host candidates connect directly
+  (0 relay bytes, typically <5ms). No configuration needed.
+- **Public relay (automatic fallback)**: TLS + WSS via dshost.me edge nodes.
+
+Force a mode via URL param: `transport=webrtc` (P2P only) or `transport=relay`
+(relay only). The default is automatic. The single-active-browser rule applies
+in P2P mode too — a superseded session's PeerConnection is revoked by the agent.
 
 ## 快速开始
 
