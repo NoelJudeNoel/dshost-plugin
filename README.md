@@ -28,6 +28,8 @@ dsh Web UI from anywhere.*
   `/api/*` 流量；中继仅交换 SDP 信令、读不到明文。对称 NAT 打洞失败自动回落加密中继
 - **局域网 / VPN（EasyTier · Tailscale）自动直连**：同一 WiFi / 局域网 / mesh 网段可达时，
   自动走 WebRTC host 候选直连（0 中继流量，通常 <5ms），无需任何配置
+- **应用层分片（plugin ≥ 0.1.25）**：SCTP 单帧超限（`max-message-size`）时按 32KB
+  切片重传，大会话 `snapshot` 超 256KB 也能完整加载（hello/auth 的 `features:['chunk']` 能力协商，老端保持旧行为）
 - **公网中继（自动回退）**：TLS + WSS（dshost.me 边缘节点），任意网络可达
 
 手动控制：URL 参数 `transport=webrtc` 只走 P2P（失败即断开，不偷偷降级）；
@@ -42,6 +44,10 @@ dsh Web UI from anywhere.*
 - **LAN / VPN (EasyTier · Tailscale) direct**: when the browser and the instance
   share a reachable LAN/mesh segment, ICE host candidates connect directly
   (0 relay bytes, typically <5ms). No configuration needed.
+- **App-level chunking (plugin ≥ 0.1.25)**: frames exceeding SCTP `max-message-size`
+  are split into 32KB slices and reassembled (`dc:chunk`), so long-session
+  snapshots (>256KB) load completely. Negotiated via `hello` / `auth` `features:['chunk']`;
+  legacy peers keep the old behaviour.
 - **Public relay (automatic fallback)**: TLS + WSS via dshost.me edge nodes.
 
 Force a mode via URL param: `transport=webrtc` (P2P only) or `transport=relay`
