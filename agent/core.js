@@ -1515,6 +1515,7 @@ export function startAgent(opts) {
     if (!peer) return false;
     flushUsage(peer);
     try { peer.pc.close(); } catch {}
+    if (peer.usage.heartbeat) clearInterval(peer.usage.heartbeat);
     activeRtcPeers.delete(clientId);
     return true;
   }
@@ -1579,6 +1580,15 @@ export function startAgent(opts) {
 
           // 用量每 60s 汇总一次；DC 关闭时再冲一次尾账。
           peer.usage.timer = setInterval(() => flushUsage(peer), 60_000);
+          // 30s 心跳：relay 的 P2P lease TTL 是 60s，而 usage 帧只在有字节时
+          // 发送——空闲浏览器不发流量时 lease 会过期，另一会话即可绕过单活跃
+          // 门卫接管 P2P 所有权。心跳（state 'open'）保持 lease 常新，成本
+          // 每 30s 一帧。
+          peer.usage.heartbeat = setInterval(() => {
+            if (!peer.authed) return;
+            if (!peer.ws || peer.ws.readyState !== 1) return;
+            try { send(peer.ws, { type: 'webrtc:peer-state', clientId: peer.clientId, state: 'open' }); } catch {}
+          }, 30_000);
 
           dc.onclose = () => {
             log.log?.(`[agent-webrtc] DataChannel closed for client ${clientId}`);
@@ -1592,6 +1602,7 @@ export function startAgent(opts) {
             peer.httpReqs.clear();
             flushUsage(peer);
             if (peer.usage.timer) clearInterval(peer.usage.timer);
+            if (peer.usage.heartbeat) clearInterval(peer.usage.heartbeat);
             if (peer.authTimer) clearTimeout(peer.authTimer);
             activeRtcPeers.delete(clientId);
             if (peer.authed && peer.ws && peer.ws.readyState === 1) {
