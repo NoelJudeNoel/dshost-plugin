@@ -940,6 +940,21 @@ export function startAgent(opts) {
         return;
       }
 
+      // WebRTC ICE 配置（relay 现签 TURN 临时凭证）
+      if (msg.type === 'webrtc:config') {
+        const cb = pendingWebrtcConfig.get(msg.reqId);
+        if (cb) { pendingWebrtcConfig.delete(msg.reqId); cb(msg); }
+        return;
+      }
+
+      // relay 吊销某个 P2P 连接（被顶替 / 登出 / 封禁 / 超配额）
+      if (msg.type === 'webrtc:revoke') {
+        if (closePeer(msg.clientId)) {
+          log.log?.(`[agent-webrtc] revoked client ${msg.clientId}`);
+        }
+        return;
+      }
+
       // WebRTC P2P 穿透打洞信令交互
       if (msg.type === 'webrtc:signal') {
         handleWebRtcSignalMessage(ws, msg);
@@ -1397,6 +1412,27 @@ export function startAgent(opts) {
   async function loadWerift() {
     if (weriftModule) return weriftModule;
     try {
+      try {
+        const resolved = import.meta.resolve ? import.meta.resolve('werift') : null;
+        if (resolved) {
+          const weriftPkgPath = new URL(resolved).pathname;
+          const weriftDir = path.dirname(weriftPkgPath);
+          const targets = [
+            path.join(weriftDir, 'index.mjs'),
+            path.join(weriftDir, 'ice/src/internal/selectAddresses.js'),
+          ];
+          for (const f of targets) {
+            if (fs.existsSync(f)) {
+              let c = fs.readFileSync(f, 'utf8');
+              if (c.includes('"tun"') || c.includes("'tun'")) {
+                c = c.replace(/costlyNetworks\s*=\s*\[[^\]]+\]/g, 'costlyNetworks = ["ipsec"]');
+                fs.writeFileSync(f, c);
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
       weriftModule = await import('werift');
       return weriftModule;
     } catch (e) {
@@ -1406,6 +1442,82 @@ export function startAgent(opts) {
   }
 
   const activeRtcPeers = new Map(); // clientId -> { pc, dc, wsStreams }
+
+  // ── ICE 配置 ──────────────────────────────────────────────────────
+  // TURN 凭证由 relay 现签（relay 持有 TURN_SECRET，agent 不该有）。缓存到
+  // 剩余 10 分钟时刷新；relay 不可达则退化为仅 STUN，P2P 可能失败但不会崩。
+  const STUN_ONLY = [
+    { urls: 'stun:39.106.35.187:3478' },
+    { urls: 'stun:111.206.174.2:3478' },
+    { urls: 'stun:111.206.174.3:3478' },
+    { urls: 'stun:47.100.127.239:3478' },
+    { urls: 'stun:stun.qq.com:3478' },
+    { urls: 'stun:stun.miwifi.com:3478' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ];
+  let iceCache = { servers: null, expiresAt: 0 };
+  const pendingWebrtcConfig = new Map(); // reqId -> resolve
+
+  function requestWebrtcConfig(ws) {
+    const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingWebrtcConfig.delete(reqId);
+        resolve(null);
+      }, 5000);
+      pendingWebrtcConfig.set(reqId, (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      });
+      send(ws, { type: 'webrtc:config-request', reqId });
+    });
+  }
+
+  async function getIceServers(ws) {
+    const now = Date.now();
+    if (iceCache.servers && iceCache.expiresAt - now > 600_000) return iceCache.servers;
+    const cfg = await requestWebrtcConfig(ws);
+    if (cfg && Array.isArray(cfg.iceServers) && cfg.iceServers.length) {
+      const ttlMs = (Number(cfg.ttl) || 3600) * 1000;
+      iceCache = { servers: cfg.iceServers, expiresAt: now + ttlMs };
+      return iceCache.servers;
+    }
+    return STUN_ONLY;
+  }
+
+  // ── P2P 用量统计（每 60s 汇总上报，供 relay 记账与配额）─────────────
+  function bump(peer, dir, n) {
+    if (!peer || !peer.usage || !n) return;
+    if (dir === 'up') peer.usage.up += n;
+    else peer.usage.down += n;
+  }
+
+  function flushUsage(peer) {
+    if (!peer || !peer.usage || !peer.ws || peer.ws.readyState !== 1) return;
+    const { up, down } = peer.usage;
+    if (!up && !down) return;
+    peer.usage.up = 0;
+    peer.usage.down = 0;
+    try {
+      send(peer.ws, {
+        type: 'webrtc:usage',
+        clientId: peer.clientId,
+        bytesUp: up,
+        bytesDown: down,
+        streams: peer.wsStreams.size,
+        windowMs: 60_000,
+      });
+    } catch {}
+  }
+
+  function closePeer(clientId) {
+    const peer = activeRtcPeers.get(clientId);
+    if (!peer) return false;
+    flushUsage(peer);
+    try { peer.pc.close(); } catch {}
+    activeRtcPeers.delete(clientId);
+    return true;
+  }
 
   async function handleWebRtcSignalMessage(ws, msg) {
     const { reqId, signalType, sdp, candidate, clientId = 'default' } = msg;
@@ -1428,23 +1540,21 @@ export function startAgent(opts) {
 
       try {
         const existing = activeRtcPeers.get(clientId);
-        if (existing) {
-          try { existing.pc.close(); } catch {}
-          activeRtcPeers.delete(clientId);
-        }
+        if (existing) closePeer(clientId);
 
-        const pc = new werift.RTCPeerConnection({
-          iceServers: [
-            { urls: 'stun:stun.cloudflare.com:3478' },
-            { urls: 'stun:stun.l.google.com:19302' },
-          ],
-        });
+        const iceServers = await getIceServers(ws);
+        const pc = new werift.RTCPeerConnection({ iceServers });
 
         const peer = {
           clientId,
           pc,
           dc: null,
+          ws,
           wsStreams: new Map(),
+          httpReqs: new Map(),
+          nonce: typeof msg.peerNonce === 'string' ? msg.peerNonce : '',
+          authed: !msg.peerNonce,
+          usage: { up: 0, down: 0, timer: null },
         };
         activeRtcPeers.set(clientId, peer);
 
@@ -1457,13 +1567,36 @@ export function startAgent(opts) {
             handleRtcDataChannelMessage(peer, dc, e.data);
           };
 
+          // 首帧必须是 auth。5s 内未认证就直接断开，避免半开连接长期挂着。
+          if (!peer.authed) {
+            peer.authTimer = setTimeout(() => {
+              if (!peer.authed) {
+                log.warn?.(`[agent-webrtc] client ${clientId} failed to authenticate, closing`);
+                closePeer(clientId);
+              }
+            }, 5000);
+          }
+
+          // 用量每 60s 汇总一次；DC 关闭时再冲一次尾账。
+          peer.usage.timer = setInterval(() => flushUsage(peer), 60_000);
+
           dc.onclose = () => {
             log.log?.(`[agent-webrtc] DataChannel closed for client ${clientId}`);
             for (const [, sWs] of peer.wsStreams) {
               try { sWs.close(); } catch {}
             }
             peer.wsStreams.clear();
+            for (const [, req] of peer.httpReqs) {
+              try { req.destroy(); } catch {}
+            }
+            peer.httpReqs.clear();
+            flushUsage(peer);
+            if (peer.usage.timer) clearInterval(peer.usage.timer);
+            if (peer.authTimer) clearTimeout(peer.authTimer);
             activeRtcPeers.delete(clientId);
+            if (peer.authed && peer.ws && peer.ws.readyState === 1) {
+              try { send(peer.ws, { type: 'webrtc:peer-state', clientId, state: 'closed' }); } catch {}
+            }
           };
 
           dc.onerror = (err) => {
@@ -1476,9 +1609,11 @@ export function startAgent(opts) {
         await pc.setLocalDescription(answer);
 
         // 等待 ICE 候选收集（嵌入至 localDescription 中返回，单次 RTT 快速握手）
+        // 2500ms：TURN-only 路径经常超过原来的 1200ms，窗口太短会拿到没有
+        // relay candidate 的 answer，握手必然失败。
         await new Promise((resolve) => {
           if (pc.iceGatheringState === 'complete') return resolve();
-          const timer = setTimeout(resolve, 800);
+          const timer = setTimeout(resolve, 2500);
           pc.onicegatheringstatechange = () => {
             if (pc.iceGatheringState === 'complete') {
               clearTimeout(timer);
@@ -1526,6 +1661,19 @@ export function startAgent(opts) {
 
     if (!msg || !msg.type) return;
 
+    // 0. 认证门禁：未认证前只接受 auth，其余消息一律丢弃。
+    if (!peer.authed) {
+      if (msg.type === 'auth' && peer.nonce && msg.nonce === peer.nonce) {
+        peer.authed = true;
+        if (peer.authTimer) { clearTimeout(peer.authTimer); peer.authTimer = null; }
+        log.log?.(`[agent-webrtc] client ${peer.clientId} authenticated`);
+        if (peer.ws && peer.ws.readyState === 1) {
+          try { send(peer.ws, { type: 'webrtc:peer-state', clientId: peer.clientId, state: 'open' }); } catch {}
+        }
+      }
+      return;
+    }
+
     // 1. P2P 测速与探测 (Ping / Pong)
     if (msg.type === 'ping') {
       try {
@@ -1549,6 +1697,8 @@ export function startAgent(opts) {
       targetHeaders.origin = `http://${dshHost}:${dshPort}`;
       if (authCookie) targetHeaders.cookie = authCookie;
       delete targetHeaders['content-length'];
+      // 压缩后的字节没法塞进构造型 Response 让浏览器解压，直接要明文。
+      targetHeaders['accept-encoding'] = 'identity';
 
       const dshReq = http.request(`http://${dshHost}:${dshPort}${url}`, {
         method,
@@ -1571,6 +1721,7 @@ export function startAgent(opts) {
         } catch {}
 
         dshRes.on('data', (chunk) => {
+          bump(peer, 'down', chunk.length);
           try {
             dc.send(JSON.stringify({
               type: 'http:chunk',
@@ -1581,13 +1732,17 @@ export function startAgent(opts) {
         });
 
         dshRes.on('end', () => {
+          peer.httpReqs.delete(streamId);
           try {
             dc.send(JSON.stringify({ type: 'http:end', streamId }));
           } catch {}
         });
       });
 
+      peer.httpReqs.set(streamId, dshReq);
+
       dshReq.on('error', (err) => {
+        peer.httpReqs.delete(streamId);
         try {
           dc.send(JSON.stringify({
             type: 'http:response',
@@ -1605,9 +1760,21 @@ export function startAgent(opts) {
       });
 
       if (body) {
-        dshReq.write(Buffer.from(body, 'base64'));
+        const buf = Buffer.from(body, 'base64');
+        bump(peer, 'up', buf.length);
+        dshReq.write(buf);
       }
       dshReq.end();
+      return;
+    }
+
+    // 2b. 浏览器中断 HTTP 流（AbortSignal）
+    if (msg.type === 'http:abort') {
+      const req = peer.httpReqs.get(msg.streamId);
+      if (req) {
+        try { req.destroy(); } catch {}
+        peer.httpReqs.delete(msg.streamId);
+      }
       return;
     }
 
@@ -1633,6 +1800,7 @@ export function startAgent(opts) {
       });
 
       dshWs.on('message', (data, isBinary) => {
+        bump(peer, 'down', isBinary ? data.length : Buffer.byteLength(data, 'utf8'));
         try {
           dc.send(JSON.stringify({
             type: 'ws:message',
@@ -1669,6 +1837,7 @@ export function startAgent(opts) {
 
     if (msg.type === 'ws:message') {
       const { streamId, data, binary } = msg;
+      bump(peer, 'up', binary ? Buffer.from(data, 'base64').length : Buffer.byteLength(data, 'utf8'));
       const dshWs = peer.wsStreams.get(streamId);
       if (dshWs && dshWs.readyState === WebSocket.OPEN) {
         if (binary) {
