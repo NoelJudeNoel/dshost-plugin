@@ -1485,6 +1485,48 @@ export function startAgent(opts) {
     return STUN_ONLY;
   }
 
+  // ICE 候选遥测：认证后 2s 抓一次 stats（给 nomination 留出时间），标注候选
+  // 类型（host/srflx/prflx/relay）、传输协议和 RTT，随下一帧 webrtc:peer-state
+  // 上报。每个 peer 只上报一次。
+  function reportIceStatsSoon(peer) {
+    if (!peer || peer.iceStatsSent) return;
+    peer.iceStatsSent = true;
+    const timer = setTimeout(() => {
+      try {
+        const statsPromise = peer.pc && peer.pc.getStats ? peer.pc.getStats() : Promise.resolve(null);
+        Promise.resolve(statsPromise).then((report) => {
+          if (!report) return;
+          let pair = null;
+          for (const s of report.values()) {
+            if (s.type === 'candidate-pair' && (s.nominated || s.state === 'succeeded')) {
+              pair = s;
+              if (s.nominated) break;
+            }
+          }
+          let localC = null;
+          if (pair) localC = report.get(pair.localCandidateId) || null;
+          if (peer.ws && peer.ws.readyState === 1) {
+            try {
+              send(peer.ws, {
+                type: 'webrtc:peer-state',
+                clientId: peer.clientId,
+                state: 'open',
+                ice: {
+                  candidateType: localC ? localC.candidateType : null,
+                  protocol: localC ? localC.protocol : null,
+                  rttMs: pair && pair.currentRoundTripTime != null
+                    ? Math.round(pair.currentRoundTripTime * 1000)
+                    : null,
+                },
+              });
+            } catch {}
+          }
+        }).catch(() => {});
+      } catch {}
+    }, 2000);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  }
+
   // ── P2P 用量统计（每 60s 汇总上报，供 relay 记账与配额）─────────────
   function bump(peer, dir, n) {
     if (!peer || !peer.usage || !n) return;
@@ -1681,6 +1723,7 @@ export function startAgent(opts) {
         if (peer.ws && peer.ws.readyState === 1) {
           try { send(peer.ws, { type: 'webrtc:peer-state', clientId: peer.clientId, state: 'open' }); } catch {}
         }
+        reportIceStatsSoon(peer);
       }
       return;
     }
@@ -1870,6 +1913,14 @@ export function startAgent(opts) {
       return;
     }
   }
+
+  // ── Agent 冷启动预热 ─────────────────────────────────────────────
+  // werift 首次 dynamic import 可能要 10–20s，否则首个 WebRTC 信令会顶到
+  // relay 的 15s 信令超时、浏览器首连永远失败。fire-and-forget：
+  // 失败只影响 P2P，不影响中继通道。
+  loadWerift().catch((e) => log.warn?.(`[agent] werift prewarm failed: ${e && e.message}`));
+  // 预取本机 dsh 的认证 cookie（dsh 重启会轮换 launch token，此处失败无害）
+  if (webToken) mintAuthCookie().catch(() => {});
 
   connect();
 
