@@ -802,29 +802,38 @@ export function startAgent(opts) {
 
   function mintAuthCookie() {
     if (minting) return minting;
-    if (!webToken) return Promise.resolve(null);
     minting = new Promise((resolve) => {
-      const req = http.get(
-        `http://${dshHost}:${dshPort}/?token=${encodeURIComponent(webToken)}`,
-        { timeout: 5000 },
-        (res) => {
-          res.resume();
-          const set = res.headers['set-cookie'];
-          if (res.statusCode === 303 && Array.isArray(set) && set[0]) {
-            authCookie = set[0].split(';')[0];
-            log.log?.('[agent] local web auth cookie minted');
-            resolve(authCookie);
-          } else {
-            log.warn?.(`[agent] local web auth mint failed (HTTP ${res.statusCode})`);
-            resolve(null);
-          }
-        },
-      );
-      req.on('timeout', () => req.destroy(new Error('mint timeout')));
-      req.on('error', (err) => {
-        log.warn?.(`[agent] local web auth mint error: ${err.message}`);
-        resolve(null);
-      });
+      const attempt = (tok) => {
+        if (!tok) return resolve(null);
+        const req = http.get(
+          `http://${dshHost}:${dshPort}/?token=${encodeURIComponent(tok)}`,
+          { timeout: 5000 },
+          (res) => {
+            res.resume();
+            const set = res.headers['set-cookie'];
+            if (res.statusCode === 303 && Array.isArray(set) && set[0]) {
+              authCookie = set[0].split(';')[0];
+              log.log?.('[agent] local web auth cookie minted');
+              resolve(authCookie);
+            } else if (res.statusCode === 401) {
+              // Stale/invalid launch token (scraped from a previous boot, or
+              // rotated). Drop it so discovery picks the current boot's token.
+              log.warn?.('[agent] local web auth mint rejected (HTTP 401) — launch token stale, re-discovering');
+              webToken = null;
+              resolve(null);
+            } else {
+              log.warn?.(`[agent] local web auth mint failed (HTTP ${res.statusCode})`);
+              resolve(null);
+            }
+          },
+        );
+        req.on('timeout', () => req.destroy(new Error('mint timeout')));
+        req.on('error', (err) => {
+          log.warn?.(`[agent] local web auth mint error: ${err.message}`);
+          resolve(null);
+        });
+      };
+      attempt(webToken);
     });
     minting.then(() => { minting = null; }, () => { minting = null; });
     return minting;
@@ -853,12 +862,12 @@ export function startAgent(opts) {
     // 2. journald: dsh >= 0.2.3 prints "dsh web: http://127.0.0.1:3080/?token=..."
     //    at every web start, and the cordis connection-inject may never fire
     //    there (service surface changed) — discover the token straight from
-    //    the boot log instead.
+    //    the boot log instead. Current boot only (-b) and the LAST match wins
+    //    (a stale previous-boot token would be rejected with 401 at mint time).
     try {
-      const out = execFileSync('journalctl', ['-n', '400', '--no-pager', '-o', 'cat'], { encoding: 'utf8', timeout: 4000 });
-      const m = out.match(/dsh web: ?\S*\/\/[^\s]*\?token=([A-Za-z0-9_-]+)/)
-        || out.match(/http:\/\/127\.0\.0\.1:\d+\/\?token=([A-Za-z0-9_-]+)/);
-      if (m) return m[1];
+      const out = execFileSync('journalctl', ['-b', '-n', '400', '--no-pager', '-o', 'cat'], { encoding: 'utf8', timeout: 4000 });
+      const all = [...out.matchAll(/http:\/\/127\.0\.0\.1:\d+\/\?token=([A-Za-z0-9_-]+)/g)];
+      if (all.length > 0) return all[all.length - 1][1];
     } catch {}
     return null;
   }
@@ -883,14 +892,14 @@ export function startAgent(opts) {
 
   if (webToken) {
     mintAuthCookie();
-  } else {
-    // The cordis inject may never deliver the launch token (dsh 0.2.3-alpha
-    // changed the connection-service surface). Poll for it briefly; the
-    // 401-on-demand path below covers anything later.
+  }
+  // Poll until a cookie actually exists (webToken alone can be a stale
+  // previous-boot token that minting will reject and invalidate).
+  {
     let tries = 0;
     const discover = setInterval(() => {
       tries++;
-      if (webToken || authCookie || tries > 12) { clearInterval(discover); return; }
+      if (authCookie || tries > 24) { clearInterval(discover); return; }
       ensureWebAuth();
     }, 5000);
     if (discover.unref) discover.unref();
@@ -1294,8 +1303,13 @@ export function startAgent(opts) {
           if ((method === 'GET' || method === 'HEAD') && !isRetry) {
             log.log?.('[agent] local dsh 401, re-minting web auth cookie and retrying');
             remint.then((c) => {
-              if (c) handleHttpRequest(ws, msg, true);
-              else respondError(ws, streamId, 502, 'dsh-remote: local web auth re-mint failed');
+              if (c) { handleHttpRequest(ws, msg, true); return; }
+              // The rejected token was just invalidated; discover the current
+              // boot's token (journald now has it) and retry once more.
+              ensureWebAuth().then((c2) => {
+                if (c2) handleHttpRequest(ws, msg, true);
+                else respondError(ws, streamId, 502, 'dsh-remote: local web auth re-mint failed');
+              });
             });
           } else {
             log.log?.('[agent] local dsh 401 on body request, re-minting web auth cookie for next requests');
