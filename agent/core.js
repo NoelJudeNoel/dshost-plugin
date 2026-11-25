@@ -840,6 +840,7 @@ export function startAgent(opts) {
 
   function getActiveWebToken() {
     if (webToken) return webToken;
+    // 1. Legacy capture file (some setups tee the launch URL here).
     try {
       if (fs.existsSync('/var/log/dsh-web.log')) {
         const content = fs.readFileSync('/var/log/dsh-web.log', 'utf8');
@@ -849,10 +850,51 @@ export function startAgent(opts) {
         }
       }
     } catch {}
+    // 2. journald: dsh >= 0.2.3 prints "dsh web: http://127.0.0.1:3080/?token=..."
+    //    at every web start, and the cordis connection-inject may never fire
+    //    there (service surface changed) — discover the token straight from
+    //    the boot log instead.
+    try {
+      const out = execFileSync('journalctl', ['-n', '400', '--no-pager', '-o', 'cat'], { encoding: 'utf8', timeout: 4000 });
+      const m = out.match(/dsh web: ?\S*\/\/[^\s]*\?token=([A-Za-z0-9_-]+)/)
+        || out.match(/http:\/\/127\.0\.0\.1:\d+\/\?token=([A-Za-z0-9_-]+)/);
+      if (m) return m[1];
+    } catch {}
     return null;
   }
 
-  if (webToken) mintAuthCookie();
+  // Make sure a launch token is known and a browser cookie is minted.
+  // Used at boot (host may hand the token late or never — alpha.2 inject gap)
+  // and on-demand when local dsh answers 401 to a proxied request.
+  let ensuringAuth = false;
+  function ensureWebAuth() {
+    if (authCookie) return Promise.resolve(authCookie);
+    if (ensuringAuth) return minting || Promise.resolve(authCookie);
+    ensuringAuth = true;
+    const done = () => { ensuringAuth = false; };
+    if (!webToken) {
+      const tok = getActiveWebToken();
+      if (!tok) { done(); return Promise.resolve(null); }
+      setWebToken(tok); // logs + mints
+      return (minting || Promise.resolve(authCookie)).finally(done);
+    }
+    return mintAuthCookie().finally(done);
+  }
+
+  if (webToken) {
+    mintAuthCookie();
+  } else {
+    // The cordis inject may never deliver the launch token (dsh 0.2.3-alpha
+    // changed the connection-service surface). Poll for it briefly; the
+    // 401-on-demand path below covers anything later.
+    let tries = 0;
+    const discover = setInterval(() => {
+      tries++;
+      if (webToken || authCookie || tries > 12) { clearInterval(discover); return; }
+      ensureWebAuth();
+    }, 5000);
+    if (discover.unref) discover.unref();
+  }
 
   // ── LAN Bridge deprecated in favor of secure WebRTC P2P (default disabled) ──
   const lanBridgePort = parseInt(process.env.LAN_BRIDGE_PORT || '3088', 10);
@@ -1240,14 +1282,15 @@ export function startAgent(opts) {
         method,
         headers: upstreamHeaders,
       }, (dshRes) => {
-        if (target.dsh && dshRes.statusCode === 401 && cookie) {
-          // Cached cookie rejected (launch token rotated, e.g. dsh restarted).
-          // Re-mint; body-less requests are retried once with the fresh
-          // cookie, everything else forwards the 401 and the browser app
-          // retries its next action with the fresh cookie.
+        if (target.dsh && dshRes.statusCode === 401) {
+          // Cached cookie rejected (launch token rotated, e.g. dsh restarted)
+          // OR we never had one (launch token never handed over — dsh 0.2.3-alpha
+          // connection-inject gap). Re-discover token + re-mint; body-less
+          // requests are retried once with the fresh cookie, everything else
+          // forwards the 401 and the browser app retries its next action.
           dshRes.resume();
           authCookie = null;
-          const remint = mintAuthCookie();
+          const remint = ensureWebAuth();
           if ((method === 'GET' || method === 'HEAD') && !isRetry) {
             log.log?.('[agent] local dsh 401, re-minting web auth cookie and retrying');
             remint.then((c) => {
@@ -1922,6 +1965,13 @@ export function startAgent(opts) {
         if (sc) {
           const list = Array.isArray(sc) ? sc : [sc];
           resHeaders['set-cookie'] = list.map(c => c.replace(/;\s*SameSite=Strict/i, '; SameSite=Lax'));
+        }
+
+        if (dshRes.statusCode === 401) {
+          // Launch token rotated or never minted (alpha.2 inject gap):
+          // re-discover + re-mint so the next proxied request carries a fresh cookie.
+          authCookie = null;
+          ensureWebAuth().catch(() => {});
         }
 
         dcSend(peer, dc, {
