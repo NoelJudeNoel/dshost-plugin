@@ -15,6 +15,8 @@ import { send, b64, un64, sanitizeCloseCode } from '../common/protocol.js';
 const MAX_WS_BUFFERED_BYTES = parseInt(process.env.MAX_WS_BUFFERED_BYTES || String(16 * 1024 * 1024), 10);
 const MAX_PENDING_FRAMES = 1024;      // frames buffered while local WS connects
 const LOCAL_WS_CONNECT_TIMEOUT_MS = 15000; // give up if local dsh WS never opens
+// Aligned below Relay 13s & EdgeOne 15s/25s so local DSH/plugin stalls surface as 504 instead of silent 524.
+const AGENT_UPSTREAM_HEADER_TIMEOUT_MS = parseInt(process.env.AGENT_UPSTREAM_HEADER_TIMEOUT_MS || '11000', 10);
 const WS_SEND_HIGH_WATER = parseInt(process.env.WS_SEND_HIGH_WATER || String(8 * 1024 * 1024), 10);
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 60000;
@@ -1284,6 +1286,10 @@ export function startAgent(opts) {
       }
       delete upstreamHeaders['content-length'];
 
+      let headerTimer = null;
+      let timedOut = false;
+      const clearHeaderTimer = () => { if (headerTimer) { clearTimeout(headerTimer); headerTimer = null; } };
+
       const dshReq = http.request({
         hostname: target.host,
         port: target.port,
@@ -1291,6 +1297,8 @@ export function startAgent(opts) {
         method,
         headers: upstreamHeaders,
       }, (dshRes) => {
+        clearHeaderTimer();
+        if (timedOut) { dshRes.resume(); return; }
         if (target.dsh && dshRes.statusCode === 401) {
           // Cached cookie rejected (launch token rotated, e.g. dsh restarted)
           // OR we never had one (launch token never handed over — dsh 0.2.3-alpha
@@ -1360,7 +1368,36 @@ export function startAgent(opts) {
         });
       });
 
+      headerTimer = setTimeout(() => {
+        if (!streams.has(streamId)) return;
+        timedOut = true;
+        streams.delete(streamId);
+        try { dshReq.destroy(); } catch {}
+        log.warn?.(`[agent] HTTP header timeout (${AGENT_UPSTREAM_HEADER_TIMEOUT_MS}ms) on ${target.dsh ? 'dsh' : target.id} ${method} ${path}`);
+        const msgBody = Buffer.from(JSON.stringify({
+          ok: false,
+          code: 'upstream_timeout',
+          source: 'agent-upstream',
+          message: `本机 ${target.dsh ? 'DSH' : `插件 ${target.id}`} 服务响应超时（>${Math.round(AGENT_UPSTREAM_HEADER_TIMEOUT_MS / 1000)}s 未返回响应头）`,
+        }));
+        send(ws, {
+          type: 'http:response',
+          streamId,
+          status: 504,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-dsh-timeout-source': 'agent-upstream',
+          },
+        });
+        send(ws, { type: 'http:data', streamId, data: b64(msgBody) });
+        send(ws, { type: 'http:end-response', streamId });
+      }, AGENT_UPSTREAM_HEADER_TIMEOUT_MS);
+      headerTimer.unref?.();
+
       dshReq.on('error', (err) => {
+        clearHeaderTimer();
+        if (timedOut) return;
         log.error?.(`[agent] HTTP Error: ${err.message}`);
         send(ws, { type: 'error', streamId, message: `${target.dsh ? 'local dsh' : `plugin ${target.id}`} upstream: ${err.message}` });
         streams.delete(streamId);
@@ -1970,10 +2007,16 @@ export function startAgent(opts) {
       // 压缩后的字节没法塞进构造型 Response 让浏览器解压，直接要明文。
       targetHeaders['accept-encoding'] = 'identity';
 
+      let p2pHeaderTimer = null;
+      let p2pTimedOut = false;
+      const clearP2pHeaderTimer = () => { if (p2pHeaderTimer) { clearTimeout(p2pHeaderTimer); p2pHeaderTimer = null; } };
+
       const dshReq = http.request(`http://${dshHost}:${dshPort}${url}`, {
         method,
         headers: targetHeaders,
       }, (dshRes) => {
+        clearP2pHeaderTimer();
+        if (p2pTimedOut) { dshRes.resume(); return; }
         const resHeaders = { ...dshRes.headers };
         const sc = resHeaders['set-cookie'];
         if (sc) {
@@ -2012,7 +2055,35 @@ export function startAgent(opts) {
 
       peer.httpReqs.set(streamId, dshReq);
 
+      p2pHeaderTimer = setTimeout(() => {
+        if (!peer.httpReqs.has(streamId)) return;
+        p2pTimedOut = true;
+        peer.httpReqs.delete(streamId);
+        try { dshReq.destroy(); } catch {}
+        const msgBody = Buffer.from(JSON.stringify({
+          ok: false,
+          code: 'upstream_timeout',
+          source: 'agent-upstream',
+          message: `本机 DSH 服务响应超时（>${Math.round(AGENT_UPSTREAM_HEADER_TIMEOUT_MS / 1000)}s 未返回响应头）`,
+        }));
+        dcSend(peer, dc, {
+          type: 'http:response',
+          streamId,
+          status: 504,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-dsh-timeout-source': 'agent-upstream',
+          },
+        });
+        dcSend(peer, dc, { type: 'http:chunk', streamId, data: msgBody.toString('base64') });
+        dcSend(peer, dc, { type: 'http:end', streamId });
+      }, AGENT_UPSTREAM_HEADER_TIMEOUT_MS);
+      p2pHeaderTimer.unref?.();
+
       dshReq.on('error', (err) => {
+        clearP2pHeaderTimer();
+        if (p2pTimedOut) return;
         peer.httpReqs.delete(streamId);
         dcSend(peer, dc, {
           type: 'http:response',
